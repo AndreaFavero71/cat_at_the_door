@@ -1,0 +1,56 @@
+{
+    "wifi": {
+        "enable": 1,
+        "ssid": "YourSSID",
+        "password": "YourWiFiPassword"
+    }
+
+    "time": {
+        "timezone": 1,
+        "dst": 1
+    }
+
+    "buzzer": {
+        "enable": 1,
+        "volume": 1,
+        "repeats": 6
+    }
+
+    "scanners": {
+        "ble_scan_time_secs": 6,
+        "ble_rssi_threshold": -100,
+        "radar_scan_time_interval_secs": 10,
+        "radar_ignor_period_s": 120,
+        "radar_keep_signal_period_s": 60
+    }
+
+    "system": {
+        "timeout_m": 150,
+        "lora_interval_s": 15
+    }
+
+    "oled_display": {
+        "oled_enabled": 0,
+        "oled_backlight_pin": 36,
+        "oled_rst_pin": 21,
+        "oled_sda_pin": 17,
+        "oled_scl_pin": 18,
+        "oled_brightess_level": 3,
+        "oled_i2c_address": "0x3C"
+    }
+
+    "lora": {
+        "spi_bus": 1,
+        "clk_pin": 9,
+        "mosi_pin": 10,
+        "miso_pin": 11,
+        "cs_pin": 8,
+        "irq_pin": 14,
+        "rst_pin": 12,
+        "dio1_pin": 13,
+        "frequency_MHz": 868,
+        "bw_KHz": 250.0,
+        "tx_power": 5,
+        "spread_factor": 9
+    }
+}
