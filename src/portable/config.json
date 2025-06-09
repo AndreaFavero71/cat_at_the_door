@@ -51,6 +51,8 @@
         "frequency_MHz": 868,
         "bw_KHz": 250.0,
         "tx_power": 5,
-        "spread_factor": 9
+        "spread_factor": 9,
+        "code_rate": 7,
+        "duty_cycle_percent":1.0
     }
 }

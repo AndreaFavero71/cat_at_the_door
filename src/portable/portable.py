@@ -1,9 +1,9 @@
 """
-Andrea Favero, 20250605
+Andrea Favero, 20250608
 
 'Door at the door' project
 Code for the portable device
-rev 0.1
+Rev 0.2
 
 
 Hardware:
@@ -29,6 +29,7 @@ Energy:
    - LoRa chip (SX1262) goes in sleep mode (settings retention).
    - MCU goes in lightsleep, if radar doesn't detect something.
 - MCU goes deepsleep if timeout is reached (device forgotten 'ON').
+- Inform the other device to adjust the LoRa signal power when too low or too high.
 
 
 EPD Display:
@@ -155,13 +156,14 @@ DIVIDER_RATIO = 4.9                      # voltage divider ratio: (R14 + R13) / 
 VBAT_READINGS = 20                       # number of readings for averaging
 CORRECTION = 1.048                       # correction of adc reading vs measured (multimeter)
 
+
 # settings for dynamic adustment of the LoRa transmission power
-LORA_RSSI_TARGET = -85                   # dBm, desired lora signal level at receiver
-LORA_RSSI_HYSTERESIS = 10                # dB of histeresys to avoid over-steering
-LORA_TX_POWER_MIN = 7                    # min possible for SX1262 (in theory down to -9)
+MIN_LORA_RSSI_TARGET = -100              # min LoRa rssi signal level, to provide feedback to sender
+MAX_LORA_RSSI_TARGET = -80               # max LoRa rssi signal level, to provide feedback to sender
+LORA_TX_POWER_MIN = -9                   # min possible for SX1262
 LORA_TX_POWER_MAX = 22                   # max possible for SX1262
-MIN_MISSED_PACKETS = 4                   # lower threshold to bring the LoRa power to MAX
-MAX_MISSED_PACKETS = 15                  # upper threshold to give up (bring the LoRa power to NOM)   
+MIN_MISSED_PACKETS = 4  # lower number of LoRa missed connections to bring the LoRa power to MAX
+MAX_MISSED_PACKETS = 15 # upper number of LoRa missed connections to give up (bring the LoRa power to NOM)   
 
 ###########################################################################################
 # settings ################################################################################
@@ -183,17 +185,21 @@ button_pressed = False              # flag to track if the encoder push button i
 
 
 # variables related to LoRa communication
-lora_connect_status = False         # flag tracking the lora connection status
-lora_connect_counter = 0            # counter tracking the number of succesfull lora connections
-prev_lora_connect_counter = 0       # counter holding the number of succesfull lora connections at previous cycle
-lora_last_connect_time_ms = 0       # (global) holds latest lora connection time (ms) to stationary device
+lora_connect_status = False         # flag tracking the LoRa connection status
+lora_connect_counter = 0            # counter tracking the number of succesfull LoRa connections
+prev_lora_connect_counter = 0       # counter holding the number of succesfull LoRa connections at previous cycle
+lora_last_connect_time_ms = 0       # (global) holds latest LoRa connection time (ms) to stationary device
 lora_rssi = None                    # lora_rssi is initially set to None
-lora_rssi_values = []               # list holding the last N values of lora_rssi
 missed_lora_packets = 0             # counter of consecutive missed LoRa packages
+lora_tx_power = 0                   # LoRa power, later get update by the config.json
 initial_lora_tx_power = 0           # initial LoRa power, later get update by the config.json
+lora_rssi_sender = None             # lora_lora_rssi_sender is initially set to None
+lora_sender_pwr_action = ""         # (one char) string for LoRa tx power adjustment at sender
+query = ""                          # query string send buy the portable device 
+toa_us = 0                          # Time-on-Air is microseconds
 
 # variables related to the radar detection status (info via LoRa communication)
-radar_detection = False             # (global) gets updated based on responder device info
+radar_detection = False             # gets updated based on responder device info
 
 
 # cat detection related initial variables
@@ -202,19 +208,20 @@ cat_at_door_reminder = False        # flag to track the presence of cats at the 
 cats_at_the_door = []               # list of cat's names detected via BLE, reset via button_pressed
 cats_lbe_rssi = []                  # list of lbe rssi detected via BLE
 cat_at_door_time = 0                # time used to idle after user aknowledges cat_at_the_door notification
-buzzer_done = 0                     # counter of thetimes the buzzer has been activated
+buzzer_done = 0                     # counter of the times the buzzer has been activated
 
 
 # battery voltage initial variabile
+battery_voltage_list = []           # initialize list holdist the last voltage measurements
 battery_voltage = 0                 # initialize variable holding the battery voltage
 battery_level = 0                   # initialize variable holding the battery level
-prev_battery_voltage = 0            # initialize variable holding the previous measure
 last_battery_check_time = 0         # initialize variable holding the last battery check time
 
 
 # system related initial variables
 wifi_connected = False              # flag to track the wifi connection status
 oled_display_menu = False           # flag to track when dealing with the menu on screen
+
 
 # mcu temperature of portable device is used as initial mcu temp of the stationary device
 last_stat_mcu_temp = mcu_temperature()
@@ -224,8 +231,9 @@ last_stat_mcu_temp = mcu_temperature()
 # functions ###############################################################################
 ###########################################################################################
 
-# Load configuration from JSON file
 def load_config(fname):
+    """Load configuration from JSON file"""
+    
     try:
         with open(fname, 'r') as f:
             config = json.load(f)
@@ -236,8 +244,9 @@ def load_config(fname):
         
 
 
-# Function loading tags related info, from JSON file
 def load_tag_ids(fname):
+    """Function loading tags related info, from JSON file"""
+    
     try:
         with open(fname, "r") as f:
             return json.load(f)
@@ -247,19 +256,20 @@ def load_tag_ids(fname):
 
 
 
-# decode my_ble_tags dictionary
 def decode_my_ble_tags(my_ble_tags):
     """
     Decodes the tags dictionary into 3 lists.
     Each cat gets an idx number, for faster LoRa communication.
     One string for 'no cats at the door' is also returned   
     """
+    
     cats_idx     = []
     cats_names   = []
     cats_macs    = []
     no_cats_text = ""
+    cats_number = len(my_ble_tags)
     
-    for idx in range(len(my_ble_tags)):
+    for idx in range(cats_number):
         if my_ble_tags[str(idx)]["name"] != "" :
             cats_idx.append(idx)
             cats_names.append(my_ble_tags[str(idx)]["name"])
@@ -267,23 +277,22 @@ def decode_my_ble_tags(my_ble_tags):
             no_cats_text+= str(idx) + "0,"
     no_cats_text = no_cats_text[:-1]    # removal of the last comma
     
-    return cats_idx, cats_names, cats_macs, no_cats_text
+    return cats_number, cats_idx, cats_names, cats_macs, no_cats_text
 
 
 
-# Initialize the backlight control pin for oled display
 def init_oled_backlight(config):
+    """Initialize the backlight control pin for oled display"""
+    
     oled_backlight_pin = Pin(config['oled_display']['oled_backlight_pin'], Pin.OUT, value=1)  # Start with backlight off
     return oled_backlight_pin
 
 
 
-# Get reset reason
 def get_reset_reason():
-    "Checks the reason for the boot, in essence what happened at the power off (WDT, DeepSleep, etc)."
+    """Checks the reason for the MCU boot, in essence what happened at the power off (WDT, DeepSleep, etc)."""
     
     reset_reason = reset_cause()          # Get reset cause
-    
     reset_message = {
         PWRON_RESET:     "POWER-ON RESET",
         HARD_RESET:      "HARD RESET",
@@ -316,11 +325,11 @@ def load_counter():
 
 def save_rtc_counter(val):
     """Save the counter to the RTC memory"""
+    
     rtc.memory(struct.pack(">H", val))
 
 
 
-# Connect to WiFi
 def get_wlan(config):
     """
     Connects to the WLAN.
@@ -329,7 +338,6 @@ def get_wlan(config):
     """
     
     print("Activating WLAN function ...")
-    
     wlan_connected = False
     print_once = True
     max_time_ms = 20000
@@ -397,7 +405,6 @@ def sync_time(utc_shift, dst_shift):
 
 
 
-# get date and time
 def get_date_time(converter, ntp_reached, date_time, utc_shift, dst_shift):
     """
     In between NPT connections, it converts from epoch to date and time individual fields.
@@ -437,12 +444,10 @@ def update_time(now, last_ntp_time_update, NTP_UPDATE_INTERVAL_S, first_time = F
 
 def init_lora(config):
     "Setup the Lora communication."
-    
-    global lora_tx_power
-    
+
     print("Activating LoRa ...")
     
-    lora_tx_power = int(config['lora']['tx_power'])       # TX power in dBm
+    lora_tx_power = int(config['lora']['tx_power'])  # TX power in dBm
     initial_lora_tx_power = lora_tx_power
     print(f"Initial LoRa transmission power: {lora_tx_power} dB")
     
@@ -476,46 +481,122 @@ def init_lora(config):
                       blocking=True          # Blocking mode
                       )
 
-        lora_sx.setBlockingCallback(False, cb)
+        lora_sx.setBlockingCallback(False, lora_callback)
         print("LoRa is active\n")
-        return lora_sx, initial_lora_tx_power
+        return lora_sx, lora_tx_power, initial_lora_tx_power
     
     except Exception as e:
         print(f"Error while activating LoRa{e}")
         sys.exit(1)
-    
 
 
 
-def adjust_lora_tx_power(lora_sx, initial_lora_tx_power, lora_rssi, lora_rssi_values, lora_tx_power, missed_lora_packets):
+def validate_lora_interval_s(duty_cycle_percent, lora_interval_s, cat_num):
     """
-    Dynamically adjust the LoRa transmission power, based on the RSSI.
-    In theory, the received signal RSSI should be used to adjust the sender's
-    device power; In this case, each device adjust its own trasmission power
-    based on the RSSI level (despite being determined by the sender device power).
-    Three main cases are considered:
+    Validate the lora_interval_s against the duty_cycle and LoRa settings.
+    duty_cycle_percent must be in percentage: 1 for 1%, 0.1 for 0.1%.
+    The ToA is regulated per single appliance: The stationary device uses
+    longer strings than the portable.
+    Calculation based on the portable device.
+    """
     
-    Case 1) No lora_rssi value, likely communication lost:
+    print("Validating the lora_interval_s settings against the duty_cycle_percent and LoRa settings ...")
+        
+    # message from the portable device ("ck" or "ck>" makes no difference)
+    msg1 = "ck>"               # this string is independant from number of cats
+
+    # possible messages from the stationary device (example refer to two cats)
+    msg2 = "xx" * cat_num + "," * (cat_num - 1)            # '00,10'
+    msg3 = msg2 + ">"                                      # '00,10>'
+    msg4 = "r" + msg2                                      # 'r00,10'
+    msg5 = "r" + msg3                                      # 'r00,10>'
+    msg6 = "tyy," + msg2                                   # 't45,00,10'
+    msg7 = "tyy," + msg3                                   # 't45,00,10>'
+    msg8 = "r" + "cc-kkk" * cat_num + "," * (cat_num - 1)  # 'r01-100,11-100'
+    msg9 = msg8 + ">"                                      # 'r01-100,11-100>'
+
+    messages = (msg1, msg2, msg3, msg4, msg5, msg6, msg7, msg8, msg9)
+    
+    # weight is an estmation of how often the msg strings are likely to happen
+    # for instance, msg1 (the query) happens 100%
+    weight = (1, 0.35, 0.35, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05)
+    
+    toa_stationary_sum_us = 0
+    for i, msg in enumerate(messages):
+        if i == 0:                                       # portable device 
+            toa_msg1_us = lora_sx.getTimeOnAir(len(msg)) # toa is calculated via the lora library
+        else:                                            # stationary devices
+            w = weight[i]                                # weighting factor
+            toa_us = lora_sx.getTimeOnAir(len(msg))      # ToA is calculated via the lora library
+            toa_stationary_sum_us += + toa_us * w                   # weighted ToA 
+    
+    avg_toa_ms = toa_stationary_sum_us/1000
+    toa_ms_allowed_hourly = int(3600*1000*duty_cycle_percent/100)
+    max_lora_connections_per_hour = toa_ms_allowed_hourly/avg_toa_ms
+    
+    min_lora_interval_s = 60                             # arbitrary value, to initialize the variable
+    if max_lora_connections_per_hour > 0:                # preventing division by zero
+        min_lora_interval_s = 3600/max_lora_connections_per_hour
+    
+    if int(min_lora_interval_s) == min_lora_interval_s:
+        min_lora_interval_s = int(min_lora_interval_s)
+    else:
+        min_lora_interval_s = 1 + int(min_lora_interval_s)
+
+    if min_lora_interval_s <= lora_interval_s:
+        print(f"Setting min_lora_interval_s = {lora_interval_s}, in config.json file,"
+              f"warrants the {duty_cycle_percent}% duty cycle")
+        print(f"Minimum time interval allowed at 'lora_interval_s': {min_lora_interval_s} s")
+        return lora_interval_s
+    else:
+        print(f"\nAverage ToA per LoRa transmission: {int(round(avg_toa_ms,0))} ms")
+        print(f"Max ToA allowed per hour due to max duty-cycle: {toa_ms_allowed_hourly} ms")
+        print(f"Max number of LoRa connection per hour: {int(round(max_lora_connections_per_hour,0))}")
+        print(f"Minimum time interval allowed at 'lora_interval_s': {min_lora_interval_s} s")
+        print(f"\nSetting min_lora_interval_s = {lora_interval_s}, in config.json file, must be increase to"
+              f"at least {min_lora_interval_s} to warrent the {duty_cycle_percent}% duty cycle")
+        print(f"CAT AT THE DOOR system proceeds by using min_lora_interval_s = {min_lora_interval_s}")
+        return min_lora_interval_s
+
+
+
+def adjust_lora_tx_power(lora_rssi_sender, lora_tx_power, missed_lora_packets):
+    """
+    Dynamically adjust the LoRa transmission power, based on feedback from the sender.
+    The sender appends one char to the LoRa query (or reply):
+    - "<" when the sender rssi is below the min LoRa rssi target
+    - ">" when the sender rssi is above the max LoRa rssi target
+    
+    Four main cases are considered:
+    
+    Case 1) No lora_rssi value, likely a communication lost:
     - If this happens more than a min number of times, LoRa power is set to MAX.
-      This is an attempt to establish communication again
+      This is an attempt to establish communication again.
     - If this happens more than a max number of times, LoRa power is set to nominal.
-      This considers one of the device is still powered off
+      This considers one of the device is still powered off.
     
-    Case 2) Weak lora_rssi value (< target - hysteresys):
-    - real time rssi value is considered.
-    - LoRa power increased by one level at the time.
+    Case 2) Weak lora_rssi value at sender (< min LoRa rssi target):
+    - LoRa power increased by one level at the time, until max is eventually reached.
     
-    Case 3) Strong lora_rssi value (> target + hysteresys):
-    - Average of last N rssi values is considered
-    - LoRa power reduced by one level at the time.
-    """
-
-    #AF
-#     print("adjust_lora_tx_power; lora_rssi:", lora_rssi)
-#     print("missed_lora_packets:", missed_lora_packets)
-    #AF
+    Case 3) Strong lora_rssi value at sender(> max LoRa rssi target):
+    - LoRa power reduced by one level at the time, until min is eventually reached.
     
-    if lora_rssi is None:
+    Case 4) lora_rssi value within badwidth at sender or no feedback:
+    - No action requested to the sender.
+    """   
+    
+    lora_sender_pwr_action = ""
+    
+    # based on the LoRa rssi on this receiver device, assign at action (one char) for the LoRa sender
+    if lora_rssi is not None:
+        missed_lora_packets = 0
+        if lora_rssi < MIN_LORA_RSSI_TARGET:
+            lora_sender_pwr_action = "<"                               
+        elif lora_rssi > MAX_LORA_RSSI_TARGET:
+            lora_sender_pwr_action = ">"
+    
+    # case the lora rssi of this device is none, the occurrence is checked before reacting
+    elif lora_rssi is None:
         missed_lora_packets += 1
         if missed_lora_packets > MIN_MISSED_PACKETS and missed_lora_packets <= MAX_MISSED_PACKETS:
             if lora_tx_power < LORA_TX_POWER_MAX:
@@ -525,54 +606,30 @@ def adjust_lora_tx_power(lora_sx, initial_lora_tx_power, lora_rssi, lora_rssi_va
         
         elif missed_lora_packets > MAX_MISSED_PACKETS:
             lora_sx.setOutputPower(initial_lora_tx_power)
+            lora_tx_power = initial_lora_tx_power
             print(f"\nSet LoRa TX power to default value: {initial_lora_tx_power} dBm")
         
-        if missed_lora_packets > 2:
-            lora_rssi_values = []
-        
-        return lora_rssi_values, lora_tx_power, missed_lora_packets
-
-    else:
-        missed_lora_packets = 0
-    
-    
-    # case of week rssi
-    if lora_rssi < LORA_RSSI_TARGET - LORA_RSSI_HYSTERESIS:
-        if lora_tx_power < LORA_TX_POWER_MAX:
+    if lora_rssi_sender is not None and lora_rssi is not None:
+        # case of week LoRa rssiat sender, and receiver not yet to its MAX power
+        if lora_rssi_sender == 0 and lora_tx_power < LORA_TX_POWER_MAX:
             lora_tx_power += 1
             lora_sx.setOutputPower(lora_tx_power)
-            print(f"\nIncreasing LoRa TX power to {lora_tx_power} dBm (average RSSI={lora_rssi})")
-    
-    # case of strong rssi, average the last N lora_rssi values is used
-    else:
-        lora_rssi_value_n = 5
-        lora_rssi_avg = LORA_RSSI_TARGET
-        lora_rssi_values.append(lora_rssi)
-        if len(lora_rssi_values) > lora_rssi_value_n:
-            lora_rssi_values = lora_rssi_values[-lora_rssi_value_n : ]
+            print(f"\nIncreasing LoRa TX power to {lora_tx_power} dBm")
         
-        if len(lora_rssi_values) > 0:
-            lora_rssi_avg = sum(lora_rssi_values)/len(lora_rssi_values)
-            
-        if len(lora_rssi_values) >= lora_rssi_value_n:
-            
-            if lora_rssi_avg > LORA_RSSI_TARGET + LORA_RSSI_HYSTERESIS and lora_tx_power > LORA_TX_POWER_MIN:
-                lora_tx_power -= 1
-                lora_sx.setOutputPower(lora_tx_power)
-                print(f"\nDecreasing LoRa TX power to {lora_tx_power} dBm (average RSSI={lora_rssi})")
+        # case of strong LoRa rssi at sender, and receiver not yet to its MIN power
+        elif lora_rssi_sender == 1 and lora_tx_power > LORA_TX_POWER_MIN:
+            lora_tx_power -= 1
+            lora_sx.setOutputPower(lora_tx_power)
+            print(f"\nDecreasing LoRa TX power to {lora_tx_power} dBm")
+
+    return lora_tx_power, missed_lora_packets, lora_sender_pwr_action
+
+
+
+def lora_callback(events):
+    """Function called by the LoRa interrupt."""
     
-    #AF
-#     print(f"Last LoRa RSSi = {lora_rssi},   lora_rssi_values = {lora_rssi_values} ")
-    #AF
-
-    return lora_rssi_values, lora_tx_power, missed_lora_packets
-
-
-
-
-def cb(events):
-    
-    global sx, lora_rssi, lora_connect_counter, lora_last_connect_time_ms, cats_status
+    global lora_rssi, lora_connect_counter, lora_last_connect_time_ms, cats_status
     
     if events & SX1262.RX_DONE:
         lora_last_connect_time_ms = utime.ticks_ms()
@@ -582,7 +639,7 @@ def cb(events):
         if error == "ERR_NONE":
             cats_status = msg.decode("utf-8")
             lora_connect_counter += 1
-            print(f"cats_status: {cats_status} ; loRa RSSI:{lora_rssi}")
+            print(f"query: {query} ; ToA:{toa_us//1000}ms ; LoRa power:{lora_tx_power} ; LoRa RSSI:{lora_rssi} ; cats_status: {cats_status}")
         else:
             print("LoRa conection error")
 
@@ -592,8 +649,8 @@ def cb(events):
 
 
 
-# Monitor the battery voltage
 def read_battery_voltage(adc_avg=0, bat_voltage=0):
+    """Monitor the battery voltage"""
     try:
         ADC_CTRL.value(1)              # Enable battery voltage measurement
         utime.sleep_ms(20)             # Stabilization delay
@@ -624,7 +681,7 @@ def get_battery_percentage(voltage):
         int: The battery percentage that best matches the voltage.
     """
     voltage_levels = [4.1, 3.93, 3.82, 3.75, 3.7, 3.65, 3.6]
-    percent_levels = [100, 80, 60, 40, 20, 10, 0]
+    percent_levels = [100, 80,   60,   40,   20,  10,   0]
 
     # Find the index of the voltage level closest to the measured voltage
     closest_index = min(range(len(voltage_levels)), key=lambda i: abs(voltage - voltage_levels[i]))
@@ -632,17 +689,24 @@ def get_battery_percentage(voltage):
 
 
 
-def check_battery(now, battery_voltage, battery_level, prev_battery_voltage,
-                  last_battery_check_time, BATTERY_CHECK_INTERVAL_S, first_time = False):
+def check_battery(now, battery_voltage, battery_voltage_list, battery_level, last_battery_check_time,
+                  BATTERY_CHECK_INTERVAL_S, first_time = False):
 
     if first_time or now > last_battery_check_time + BATTERY_CHECK_INTERVAL_S:
         battery_voltage = round(read_battery_voltage(),2) # battery voltage is measured   
+        battery_voltage_list.append(battery_voltage)
+        
+        if len(battery_voltage_list) > 1:
+            battery_voltage = sum(battery_voltage_list) / len(battery_voltage_list)
+        elif len(battery_voltage_list) > 5:
+            battery_voltage_list = battery_voltage_list[-5:]
+            
         battery_level = get_battery_percentage(battery_voltage)
+        
         print(f"\nBattery voltage = {battery_voltage:.2f}V,  Battery level = {battery_level}%\n")
-        prev_battery_voltage = battery_voltage   # battery voltage is assigned to prev_battery_voltage
         last_battery_check_time = utime.time()
     
-    return battery_voltage, battery_level, prev_battery_voltage, last_battery_check_time
+    return battery_voltage, battery_voltage_list, battery_level, last_battery_check_time
 
 
 
@@ -703,20 +767,30 @@ def get_either_epd_ble_wlan(choice, config,  ubluetooth, network):
 
 def analyze_cats_status(cats_status):
     """
-    cat_status, for 2 cats, looks like: t44,r01-60,11-50
+    cat_status, for 2 cats, looks like: t44,r01-60,11-50<
     t44 = Stationary device mcu temperature 44 degC
     r = radar has detected something (very likely a cat)
     01-60 = 0:cat0, 1:at the door, -60: ble rssi
     11-50 = 1:cat1, 1:at the door, -50: ble rssi
-
+    Ending character '<' or '>' only when necessary, otherwise absent
+    < means the receiver gets a weak rssi signal
+    > means the receiver gets a strong rssi signal
     """
 
     at_the_door = []                            # empty list to store cats name when at the door
     lbe_rssi = []                               # empty list to store lbe rssi when at the door
     detected = cats_status.replace(" ", "")     # cats_status is assigned to local variable detected
+    lora_rssi_sender = None                     # rssi level at receiver (0=weak, 1=ok, 2=strong)
     stat_mcu_temp = ""                          # empty string is assign to local stat_mcu_temp variable
     
-    
+    if detected[-1] == '<':                     # case detected ends with 'r'
+        lora_rssi_sender = 0                    # rssi level of the receiver set to 0 (=weak)
+        detected = detected[-1]                 # last character is removed from detected
+
+    elif detected[-1] == '>':                   # case detected ends with '>'
+        lora_rssi_sender = 1                    # rssi level of the receiver set to 1 (=strong)
+        detected = detected[-1]                 # last character is removed from detected
+        
     if detected[0] == 'r':                      # case detected starts with 'r'
         detected = detected[1:]                 # initial 'r' is removed to detected
     
@@ -732,6 +806,7 @@ def analyze_cats_status(cats_status):
             cats_number = 1                     # 1 cat
         else:                                   # less than 2 characters
             cats_number = 0                     # no cats
+            
     
     for idx in range(cats_number):              # iteration for the number of cats
         if ',' in detected:                     # case there is a comma in detected
@@ -754,21 +829,25 @@ def analyze_cats_status(cats_status):
                 cat_name = cats_names[int(detected[0])]  # name of the cat at the door
                 at_the_door.append(cat_name)    # cat name added to at_the_door
                 lbe_rssi.append(detected[2:])   # lbe_rssi of that tag is assigned
-            return at_the_door, lbe_rssi, stat_mcu_temp   # the return break the iteration
-    
-    return at_the_door, lbe_rssi, stat_mcu_temp # return the empty lists when no cats at the door
+            
+            # the return break the iteration
+            return at_the_door, lbe_rssi, stat_mcu_temp, lora_rssi_sender
+        
+    # return the empty lists when no cats at the door
+    return at_the_door, lbe_rssi, stat_mcu_temp, lora_rssi_sender 
 
 
 
 def stop_beep(buzzer_timer=None):
     """Stop buzzer and cleanup timer. Pass timer object as arg to avoid global."""
+    
     BUZZER.duty_u16(65535)  # Transistor OFF
     if buzzer_timer:
         buzzer_timer.deinit()
 
 def start_beep(duration_ms=200, freq=1000, volume=5):
-    """Start a beep with auto-stop. Adaptive volume on frequency.
-    """
+    """Start a beep with auto-stop. Adaptive volume on frequency."""
+    
     stop_beep(buzzer_timer) # Stop any previous beep
     scaled_volume = max(1, min(100,int(freq * 0.023 + volume * 3.05 + 2 )))  # dynamic volume scaling
     duty = max(250, min(65535, int(65535 - (scaled_volume * 655.35))))       # reversing PWM (transistor), and ceiling it
@@ -783,6 +862,7 @@ def start_beep(duration_ms=200, freq=1000, volume=5):
 
 
 def activate_buzzer():
+    """Activate the buzzer with a few short beeps."""
     for i in range(4):
         period = 150 + i*10
         start_beep(duration_ms=50+i*10, freq=700, volume=buzzer_volume)
@@ -791,6 +871,8 @@ def activate_buzzer():
     
     
 def clean_mem():
+    """Function to clean the memory"""
+    
     print("gc.mem_alloc():", gc.mem_alloc())
     print("gc.mem_free():" , gc.mem_free())
     gc.collect()
@@ -801,7 +883,9 @@ def clean_mem():
 
 
 
-def get_display_epd(epd):           
+def get_display_epd(epd):
+    """Function preparing a Display oject based on Framebuffer."""
+    
     epd.init_Fast()     # wake the epd up from sleep
     epd.new_buffer()    # makes a new HLSB buffer (protrait display orientation ...)
     epd.fb.fill(0xff)   # generates the white background (epd works inverted)
@@ -814,10 +898,10 @@ def get_display_epd(epd):
 
 def header_epd(epd, display_epd, lora_connect_status, wifi_connected, battery_level, date_time,
                last_stat_mcu_temp, lora_iterations, second_row=True):
-    
-    #AF
-    global lora_tx_power
-    #AF
+    """
+    Plots the one or two headers rows on the EPD display.
+    The plotted infor are informative about the system.
+    """
     
     # plot info related to the LoRa connection
     if lora_connect_status:                         # case of LoRa connection success
@@ -889,12 +973,12 @@ def header_epd(epd, display_epd, lora_connect_status, wifi_connected, battery_le
         wri.printstring(temp_txt, invert=True)     # plot the string
         
         # plot the LoRa connections counter
-        connections_txt = f"SCAN: {lora_iterations}"  # string with the lora_iterations
+        connections_txt = f"SCAN {lora_iterations}"  # string with the lora_iterations
         if not lora_connect_status:                # case the (last) LoRa connection fails
-            connections_txt += " (NO LoRa)"        # a note is added to the text message
+            connections_txt += "(NO LoRa)"         # a note is added to the text message
         
         #AF
-        connections_txt += "  dB:" + str(lora_tx_power)
+        connections_txt += " dB " + str(lora_tx_power)
         #AF
         
         Writer.set_textpos(display_epd, 105, 0)    # writer coordinates first y then x
@@ -927,6 +1011,10 @@ def show_info_epd(epd, wifi_connected, battery_level, date_time, last_stat_mcu_t
                   radar_detection, cats_at_the_door, cat_at_door_reminder,
                   cat_at_door_time, cats_lbe_rssi, lora_iterations):
     
+    """
+    Recall the one or two headers rows on the EPD display.
+    Plots the main info, like the cats names when detected.
+    """
     
     # plots the basic info (header), like the connections icons, battery, buzzer, date and time, etc
     display_epd = get_display_epd(epd)
@@ -988,16 +1076,14 @@ def show_info_epd(epd, wifi_connected, battery_level, date_time, last_stat_mcu_t
     epd.get_buffer()    # rotates the buffer to send it to the display (portrait wrinting, resulting (takes ca 60ms)
     epd.display()       # plots the buffer to the display (takes ca 1.8 secs)
     epd.sleep()         # prevents display damages on the long run (command takes ca 100ms)
-    
-#     # returns some objects to get cancelled, to start clean the next iteration
-#     return display_epd, wri # display_epd is returned 
-
 
 
 
 def show_ack_epd(epd, wifi_connected, battery_level, date_time,
                  last_stat_mcu_temp, lora_iterations, show_time=5):
-    
+    """
+    Plots an AKNOWLEDGEMENT feedback on the EPD display.
+    """
     # plots the basic info (header), like the connections icons, battery, date nd time, etc
     display_epd = get_display_epd(epd)
     header_epd(epd, display_epd, lora_connect_status, wifi_connected,
@@ -1019,6 +1105,9 @@ def show_ack_epd(epd, wifi_connected, battery_level, date_time,
 
 
 def show_deepsleep_epd():
+    """
+    Plots a sleeping icon on the EPD display.
+    """
     
     # plots deepsleep image to the EPD before before entering in deepsleep
     with open("lib/deepsleep_icon.bin", "rb") as f:       # opens the binary file with welcome bmp image
@@ -1035,7 +1124,8 @@ def show_deepsleep_epd():
     
     
     
-def clear_epd(epd, wifi_connected, battery_level, date_time):         
+def clear_epd(epd, wifi_connected, battery_level, date_time):
+    """Clears the EPD display."""
     
     # plots the basic info (header), like the connections icons, battery, date nd time, etc
     display_epd = get_display_epd(epd)
@@ -1075,13 +1165,10 @@ def oled_display_text(oled_display, oled_backlight_pin, text_lines, keep_active=
 
 
 
-
-
-
-
 def goto_deepsleep():
-    print("\nPreparing for MCU deepsleep")
+    """Stops the periferies, calls the sleep icon for the EPD dispaly and call the MCU deepsleep."""
     
+    print("\nPreparing for MCU deepsleep")
     
     if wifi_enabled:
         try:
@@ -1107,7 +1194,6 @@ def goto_deepsleep():
     
     show_deepsleep_epd()     # epd display plots a sleeping feedback
     deepsleep()              # device goes into deepsleep
-
 
 
 
@@ -1158,16 +1244,18 @@ config = load_config(FILE_NAME_CONFIG)
 
 # retrive settings from the config dictionaty
 
-wifi_enabled =      bool(config["wifi"]["enable"])               # wifi gets eventually enabled
+wifi_enabled =      bool(config["wifi"]["enable"])       # wifi gets eventually enabled
 oled_disp_enabled = bool(config["oled_display"]["oled_enabled"]) # oled display gets eventually enabled
-sytem_timeout_m =        config["system"]["timeout_m"]       # timeout, in minutes, for the portable device deepsleep
+sytem_timeout_m =        config["system"]["timeout_m"]   # timeout, in minutes, for the portable device deepsleep
 lora_interval_s =        config["system"]["lora_interval_s"] # cadence, in secs, to connect with the stationary device
-utc_shift =              config["time"]["timezone"] # Adjust UTC time by timezone and DST (Day Saving Time: 1=yes, 0=no)
-dst_shift =              config["time"]["dst"]      # dst_shift = utc_shift + 1 if config["time"]["dst"] else utc_shift
+utc_shift =              config["time"]["timezone"]      # Adjust UTC time by timezone and DST (Day Saving Time: 1=yes, 0=no)
+dst_shift =              config["time"]["dst"]           # dst_shift = utc_shift + 1 if config["time"]["dst"] else utc_shift
+
+duty_cycle_percent =     config["lora"]["duty_cycle_percent"]  # allowed duty-cycle in percentage (1 for 1% ; 0.1 for 0.1%)
 
 radar_min_signal_time_s = int(config["scanners"]["radar_keep_signal_period_s"])  # period (s) idling after acknowledge 'cats at the door'
 
-buzzer_enabled = bool(config["buzzer"]["enable"])   # enable/disable the buzzer function
+buzzer_enabled = bool(config["buzzer"]["enable"])  # enable/disable the buzzer function
 buzzer_volume =  int(config["buzzer"]["volume"])   # buzzer volume
 if buzzer_volume > 9:                              # case buzzer_volume is > than 9 (likely entered as range 0~100)
     buzzer_volume = buzzer_volume * 9 // 100       # buzzer volume is scaled down to range 0~9
@@ -1188,7 +1276,7 @@ if WDT_ENABLED:                     # case the WDT_ENABLED is set True
 
 # Load ble_tags data
 my_ble_tags = load_tag_ids(FILE_NAME_TAGS)
-cats_idx, cats_names, cats_macs, no_cats_text = decode_my_ble_tags(my_ble_tags)
+cats_number, cats_idx, cats_names, cats_macs, no_cats_text = decode_my_ble_tags(my_ble_tags)
 cats_status = no_cats_text
 # print("my_ble_tags:", my_ble_tags)
 # print(f"\nText for no-cats detection: {no_cats_text}")
@@ -1196,7 +1284,11 @@ cats_status = no_cats_text
 
 
 # Initialize the SX1262 LoRa module
-lora_sx, initial_lora_tx_power = init_lora(config)
+lora_sx, lora_tx_power, initial_lora_tx_power = init_lora(config)
+
+
+# validates the lora_interval_s setting against the duty_cycle_percent and LoRa settings
+lora_interval_s = validate_lora_interval_s(duty_cycle_percent, lora_interval_s, cats_number)
 
 
 # datetime conversion from EPOCH to date time
@@ -1246,10 +1338,10 @@ last_ntp_time_update, date_time = update_time(now, last_ntp_time_update, NTP_UPD
 
 
 # first check of the battery voltage and related level 
-battery_voltage, battery_level, prev_battery_voltage, last_battery_check_time = check_battery(now,
+battery_voltage, battery_voltage_list, battery_level, last_battery_check_time = check_battery(now,
                                                                                               battery_voltage,
+                                                                                              battery_voltage_list,
                                                                                               battery_level,
-                                                                                              prev_battery_voltage,
                                                                                               last_battery_check_time,
                                                                                               BATTERY_CHECK_INTERVAL_S)
 
@@ -1269,7 +1361,7 @@ print(f"{'#' * 60}\n")
 ################################################################################################
 ################################################################################################
 
-
+test = 0
 
 while True:
     
@@ -1284,14 +1376,14 @@ while True:
     
     
     # check the battery voltage and level (no action when BATTERY_CHECK_INTERVAL_S is not elapsed)
-    battery_voltage, battery_level, prev_battery_voltage, last_battery_check_time = check_battery(now,
-                                                                                              battery_voltage,
-                                                                                              battery_level,
-                                                                                              prev_battery_voltage,
-                                                                                              last_battery_check_time,
-                                                                                              BATTERY_CHECK_INTERVAL_S)
+    battery_voltage, battery_voltage_list, battery_level, last_battery_check_time = check_battery(now,
+                                                                                                  battery_voltage,
+                                                                                                  battery_voltage_list,
+                                                                                                  battery_level,
+                                                                                                  last_battery_check_time,
+                                                                                                  BATTERY_CHECK_INTERVAL_S)
 
-    
+
     # check the current time and synchronize with npt (no action when NTP_UPDATE_INTERVAL_S is not elapsed)
     last_ntp_time_update, date_time = update_time(now, last_ntp_time_update, NTP_UPDATE_INTERVAL_S)
     
@@ -1318,8 +1410,8 @@ while True:
             cat_at_door_reminder = False       # reset the cat_at_door_reminder 
             buzzer_done = 0                    # reset the buzzer counter
             print("Aknowledged the cat_at_door reminder")  # feedback is printed to the terminal
-            show_ack_epd(epd, wifi_connected, battery_level,
-                         date_time, last_stat_mcu_temp, lora_iterations) # plot info to the epd display
+#             show_ack_epd(epd, wifi_connected, battery_level,
+#                          date_time, last_stat_mcu_temp, lora_iterations) # plot info to the epd display
 
     
     # checking if it is time connect with the stationary device
@@ -1335,14 +1427,15 @@ while True:
         lora_connect_status = False 
         
         # portable device (this one) sends 'ck' to the stationary device (ck means check)
-        lora_sx.send(bytes("ck", "utf-8"))
+        # and adds a character indicating the eventual need for LoRa power adjustement
+        query = "ck" + lora_sender_pwr_action
+        lora_sx.send(bytes(query, "utf-8"))
+        toa_us = lora_sx.getTimeOnAir(len(query))
 
         # looping while waiting to the LoRa response (max 3 secs)
         t_ref = utime.ticks_ms()
         while utime.ticks_ms() - t_ref < 3000:
             if lora_connect_counter > prev_lora_connect_counter:
-#                 print(f"Successfull LoRa connections: {lora_connect_counter}",
-#                       f" ;Stationary device replied in {utime.ticks_ms() - t_ref} ms")
                 prev_lora_connect_counter = lora_connect_counter
                 lora_sx.sleep(retainConfig=True)  # set the LoRa chip to sleep
                 lora_connect_status = True
@@ -1359,18 +1452,21 @@ while True:
             lora_last_connect_time_ms = now_ms
             print("LoRa connection failure: Check if the stationary device is powered on")
         
+        # debug purpose: force radar and cat detection for debug purpose:
+#         cats_status = "r01-90"
+        
         # radar detection status based on loRa info
         radar_detection = True if cats_status[0] == 'r' else False # r means radar
         
         # reset cat_at_door_flag (i.e. when the stationary dev is booted)
         if cats_status[0] == 'd':                   # 'd' means disabled
-            cat_at_door_flag = False                # flag to track the presence of cats at the door is set False  
-        
-#         # debug purpose: forcing cat presence for debug purpose:
-#         cats_status = "r01"
+            cat_at_door_flag = False                # flag to track the presence of cats at the door is set False
+            cats_status = cats_status[1:]           # initial 'd' is removed from the cats_status string
         
         # analyze the cats status (LoRa info)
-        at_the_door, cats_lbe_rssi, stat_mcu_temp = analyze_cats_status(cats_status)
+        at_the_door, cats_lbe_rssi, stat_mcu_temp, lora_rssi_sender = analyze_cats_status(cats_status)
+        
+        # case no mcu_temp update from the stationary device
         if stat_mcu_temp != "":
             last_stat_mcu_temp = stat_mcu_temp
 
@@ -1409,24 +1505,21 @@ while True:
                       cat_at_door_time, cats_lbe_rssi, lora_iterations)
         
         # check and eventually adjust the loRa trasnmission power
-        lora_rssi_values, lora_tx_power, missed_lora_packets = adjust_lora_tx_power(lora_sx,
-                                                                                    initial_lora_tx_power,
-                                                                                    lora_rssi,
-                                                                                    lora_rssi_values,
-                                                                                    lora_tx_power,
-                                                                                    missed_lora_packets)
+        lora_tx_power, missed_lora_packets, lora_sender_pwr_action = adjust_lora_tx_power(lora_rssi_sender,
+                                                                                          lora_tx_power,
+                                                                                          missed_lora_packets)
         
-        # preventing adjustments based on old lora_rssi values
+        # preventing LoRa power adjustments based on old lora_rssi values
         lora_rssi = None    # set lora_rssi to None
         
         # measure the cycle time (in ms)
         cycle_time = utime.ticks_ms() - now_ms
         
-        # lightsleep while waiting for the next loRa connections (reduce battery consumption)
+        # MCU lightsleep while waiting for the next loRa connections (reduce battery consumption)
         if not cat_at_door_flag:
             lightsleep(lora_conn_interval_ms - cycle_time)
         
-        # checks if devise is active longer than timeout
+        # checks if devise is active longer than timeout; If so go to deepsleep
         if lora_iterations >= max_lora_iterations:   # case the lora iterations equals/exceed the max
             goto_deepsleep()                         # calls the goto_deepsleep function
         

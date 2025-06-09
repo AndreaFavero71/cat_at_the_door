@@ -1,12 +1,12 @@
 
 """
-Andrea Favero 3
+Andrea Favero 20250608
 
 
 
 'Door at the door' project
 Code for the stationary device (essentially a LoRa sensor)
-Rev 0.0
+Rev 0.1
 
 ################################################################################
 ##### had to remove the display functions, as I mechanically broke it during ###
@@ -21,7 +21,9 @@ Logic:
 - Stationary device keeps monitoring the radar signal (output pin)
 - When it receives a "check" via the LoRa:
     - if the radar does not sense, it replies with 'no_cats_text' via LoRa.
-    - if the radar senses the BLE scans for BLE tags, ad replies via LoRa with 'r' + cats-status
+    - if the radar senses the BLE scans for BLE tags, ad replies via LoRa with 'r' + cats-status.
+    - if initial idling, it replies with 'd' + cats-status ('d'eactivated radar).
+    - N times (4) out of M (80) it prepend the MCU temperature 'txx' in deg. Celsius.
 
 Setting to apply to the radar, via the HLKRadarTool app:
   HLK LD2010C: set output pin active LOW
@@ -64,12 +66,12 @@ OLED_REFRESH_PERIOD_MS = 2000            # cadence for the info refreshment at o
 MCU_TEMP_RUN_CADENCE = 80                # cadence of sending mcu temperature via LoRa ( 4 out of this Value)
 
 # settings for dynamic adustment of the LoRa transmission power
-LORA_RSSI_TARGET = -80                   # dBm, desired lora signal level at receiver
-LORA_RSSI_HYSTERESIS = 5                 # dB of histeresys to avoid over-steering
-LORA_TX_POWER_MIN = 7                    # min possible for SX1262 (in theory down to -9)
-LORA_TX_POWER_MAX = 22                   # max possible for SX1262
-MIN_MISSED_PACKETS = 4    # min quantity of lost LoRa connections, to bring the LoRa power to MAX
-MAX_MISSED_PACKETS = 15   # max quantity of lost LoRa connections to give up (bring the LoRa power to NOM)
+MIN_LORA_RSSI_TARGET = -100              # min LoRa rssi signal level at receiver, to feedback the sender
+MAX_LORA_RSSI_TARGET = -80               # max LoRa rssi signal level at receiver, to feedback the sender
+LORA_TX_POWER_MIN = -9                   # min possible LoRa power for SX1262
+LORA_TX_POWER_MAX = 22                   # max possible LoRa power for SX1262
+MIN_MISSED_PACKETS = 4    # min number of missed LoRa connections, to bring the LoRa power to MAX
+MAX_MISSED_PACKETS = 15   # max number of missed LoRa connections to give up (bring the LoRa power to NOM)
 
 
 
@@ -90,17 +92,20 @@ prev_radar = 0                           # initial radar variables
 
 mcu_temp = 0                             # mcu temperature is initially set to zero
 
-lora_rssi = None                         # lora_rssi is initially set to None
-lora_rssi_values = []                    # list holding the last N values of lora_rssi
+lora_rssi = None                         # lora_rssi initially set to None, later a negative integer
 missed_lora_packets = 0                  # counter of consecutive missed LoRa packages
 initial_lora_tx_power = 0                # initial LoRa power, later get update by the config.json
+lora_rssi_sender = None                  # lora_rssi_sender initially set to None, later from 0 to 2
+lora_sender_action = ""                  # (one char) string for LoRa tx power adjustment at sender
+toa_us = 0                               # Time-on-Air is microseconds
 
 ###########################################################################################
 # functions ###############################################################################
 ###########################################################################################
 
-# Load configuration from JSON file
+
 def load_config(fname):
+    """Load configuration from JSON file"""
     print("\nLoading the configuration ...")
     try:
         with open(fname, 'r') as f:
@@ -112,8 +117,9 @@ def load_config(fname):
         sys.exit(1)
 
 
-# Function to load tags IDs
+
 def load_tags_ids(fname):
+    """Function to load tags IDs"""
     print("\nLoading the BLE tags mapping ...")
     try:
         with open(fname, "r") as f:
@@ -124,8 +130,9 @@ def load_tags_ids(fname):
         sys.exit(1)
     
 
-# decode my_ble_tags dictionary
+
 def decode_my_ble_tags(my_ble_tags):
+    """Decode my_ble_tags dictionary"""
     cats_idx, cats_names, cats_macs, no_cats_text = [], [], [], ""
     
     for idx in range(len(my_ble_tags)):
@@ -139,8 +146,8 @@ def decode_my_ble_tags(my_ble_tags):
 
 
 
-# Initialize the backlight control (pwm)
 def init_backlight(config, oled_brightness, bright_level=3):
+    """Initialize the backlight control (pwm)"""
     try:    
         # PWM init (note the max acceptable frequency is only 2445)
         oled_backlight = PWM(Pin(config['oled_display']['oled_backlight_pin']),
@@ -152,8 +159,9 @@ def init_backlight(config, oled_brightness, bright_level=3):
         sys.exit(1)
 
 
-# Initialize the Oled Display pin
+
 def init_oled_display_rst_pin(config):
+    """Initialize the Oled Display pin"""
     try:
         oled_rst_pin = Pin(config['oled_display']['oled_rst_pin'], Pin.OUT, value=1)   # GPIO setting, keeps reset forset to high (value=1)
         return oled_rst_pin
@@ -162,8 +170,9 @@ def init_oled_display_rst_pin(config):
         sys.exit(1)
 
 
-# Initialize I2C for the OLED display
+
 def init_i2c(config):
+    """Initialize I2C for the OLED display"""
     print("Activating I2C function ...")
     try:
         # Set I2C pins in open_drain mode
@@ -178,6 +187,7 @@ def init_i2c(config):
 
 
 def init_ble():
+    """Initialize Blue Tootyh Low energy (BLE)."""
     print("Activating BLE function ...")
     try:
         attempts = 5
@@ -201,6 +211,10 @@ def init_ble():
 
 
 def scan_ble():
+    """
+    Function to scan for BLE tags, and filter out those with RSSI below threshold.
+    A scanning timeout applies.
+    """
     detected_ble_tags = {}
     unique_identifiers = set()  # Track unique ble_tags using their identifiers
     
@@ -236,6 +250,7 @@ def scan_ble():
 
 
 def analyze_ble_tags(detected_ble_tags, cats_idx, cats_names, cats_macs):
+    """Compares the detected BLE tag with those of the cats."""
     ret = {}
     
     printout = False
@@ -259,11 +274,9 @@ def analyze_ble_tags(detected_ble_tags, cats_idx, cats_names, cats_macs):
 def init_lora(config):
     "Setup the Lora communication."
     
-    global lora_tx_power
-    
     print("Activating LoRa ...")
     
-    lora_tx_power = int(config['lora']['tx_power'])       # TX power in dBm
+    lora_tx_power = int(config['lora']['tx_power'])  # TX power in dBm
     initial_lora_tx_power = lora_tx_power
     print(f"Initial LoRa transmission power: {lora_tx_power} dB")
     
@@ -300,7 +313,7 @@ def init_lora(config):
 
         lora_sx.setBlockingCallback(False, cb)
         print("LoRa activated\n")
-        return lora_sx, initial_lora_tx_power
+        return lora_sx, lora_tx_power, initial_lora_tx_power
     
     except Exception as e:
         print(f"Error while activating LoRa {e}")
@@ -308,35 +321,42 @@ def init_lora(config):
 
 
 
-def adjust_lora_tx_power(lora_sx, initial_lora_tx_power, lora_rssi, lora_rssi_values, lora_tx_power, missed_lora_packets):
+def adjust_lora_tx_power(lora_rssi_sender, lora_tx_power, missed_lora_packets):
     """
-    Dynamically adjust the LoRa transmission power, based on the RSSI.
-    In theory, the received signal RSSI should be used to adjust the sender's
-    device power; In this case, each device adjust its own trasmission power
-    based on the RSSI level (despite being determined by the sender device power).
-    Three main cases are considered:
+    Dynamically adjust the LoRa transmission power, based on feedback from the sender.
+    The sender appends one char to the LoRa query (or reply):
+    - "<" when the sender rssi is below the min LoRa rssi target
+    - ">" when the sender rssi is above the max LoRa rssi target
     
-    Case 1) No lora_rssi value, likely communication lost:
+    Four main cases are considered:
+    
+    Case 1) No lora_rssi value, likely a communication lost:
     - If this happens more than a min number of times, LoRa power is set to MAX.
-      This is an attempt to establish communication again
+      This is an attempt to establish communication again.
     - If this happens more than a max number of times, LoRa power is set to nominal.
-      This considers one of the device is still powered off
+      This considers one of the device is still powered off.
     
-    Case 2) Weak lora_rssi value (< target - hysteresys):
-    - real time rssi value is considered.
-    - LoRa power increased by one level at the time.
+    Case 2) Weak lora_rssi value at sender (< min LoRa rssi target):
+    - LoRa power increased by one level at the time, until max is eventually reached.
     
-    Case 3) Strong lora_rssi value (> target + hysteresys):
-    - Average of last N rssi values is considered
-    - LoRa power reduced by one level at the time.
+    Case 3) Strong lora_rssi value at sender(> max LoRa rssi target):
+    - LoRa power reduced by one level at the time, until min is eventually reached.
+    
+    Case 4) lora_rssi value within badwidth at sender or no feedback:
+    - No action requested to the sender.
     """
-
-    #AF
-#     print("adjust_lora_tx_power; lora_rssi:", lora_rssi)
-#     print("missed_lora_packets:", missed_lora_packets)
-    #AF
     
-    if lora_rssi is None:
+    # based on the LoRa rssi on this device, assign at action (one char) for the sender
+    lora_sender_action = ""
+    if lora_rssi is not None:
+        missed_lora_packets = 0
+        if lora_rssi < MIN_LORA_RSSI_TARGET:
+            lora_sender_action = "<"                               
+        elif lora_rssi > MAX_LORA_RSSI_TARGET:
+            lora_sender_action = ">"
+    
+    # case the LoRa rssi of this device is none, the occurrence is checked before reacting
+    elif lora_rssi is None:
         missed_lora_packets += 1
         if missed_lora_packets > MIN_MISSED_PACKETS and missed_lora_packets <= MAX_MISSED_PACKETS:
             if lora_tx_power < LORA_TX_POWER_MAX:
@@ -346,53 +366,30 @@ def adjust_lora_tx_power(lora_sx, initial_lora_tx_power, lora_rssi, lora_rssi_va
         
         elif missed_lora_packets > MAX_MISSED_PACKETS:
             lora_sx.setOutputPower(initial_lora_tx_power)
+            lora_tx_power = initial_lora_tx_power
             print(f"\nSet LoRa TX power to default value: {initial_lora_tx_power} dBm")
-        
-        if missed_lora_packets > 2:
-            lora_rssi_values = []
-        
-        return lora_rssi_values, lora_tx_power, missed_lora_packets
-
-    else:
-        missed_lora_packets = 0
     
-    
-    # case of week rssi
-    if lora_rssi < LORA_RSSI_TARGET - LORA_RSSI_HYSTERESIS:
-        if lora_tx_power < LORA_TX_POWER_MAX:
+    if lora_rssi_sender is not None and lora_rssi is not None:
+        # case of week LoRa rssi at sender, and receiver not yet to MAX
+        if lora_rssi_sender == 0 and lora_tx_power < LORA_TX_POWER_MAX:
             lora_tx_power += 1
             lora_sx.setOutputPower(lora_tx_power)
-            print(f"\nIncreasing LoRa TX power to {lora_tx_power} dBm (average RSSI={lora_rssi})")
-    
-    # case of strong rssi, average the last N lora_rssi values is used
-    else:
-        lora_rssi_value_n = 5
-        lora_rssi_avg = LORA_RSSI_TARGET
-        lora_rssi_values.append(lora_rssi)
-        if len(lora_rssi_values) > lora_rssi_value_n:
-            lora_rssi_values = lora_rssi_values[-lora_rssi_value_n : ]
+            print(f"\nIncreasing LoRa TX power to {lora_tx_power} dBm")
         
-        if len(lora_rssi_values) > 0:
-            lora_rssi_avg = sum(lora_rssi_values)/len(lora_rssi_values)
-            
-        if len(lora_rssi_values) >= lora_rssi_value_n:
-            
-            if lora_rssi_avg > LORA_RSSI_TARGET + LORA_RSSI_HYSTERESIS and lora_tx_power > LORA_TX_POWER_MIN:
-                lora_tx_power -= 1
-                lora_sx.setOutputPower(lora_tx_power)
-                print(f"\nDecreasing LoRa TX power to {lora_tx_power} dBm (average RSSI={lora_rssi})")
-    
-    #AF
-#     print(f"Last LoRa RSSi = {lora_rssi},   lora_rssi_values = {lora_rssi_values} ")
-    #AF
+        # case of strong LoRa rssi at sender, and receiver not yet to MIN
+        elif lora_rssi_sender == 1 and lora_tx_power > LORA_TX_POWER_MIN:
+            lora_tx_power -= 1
+            lora_sx.setOutputPower(lora_tx_power)
+            print(f"\nDecreasing LoRa TX power to {lora_tx_power} dBm")
 
-    return lora_rssi_values, lora_tx_power, missed_lora_packets
+    return lora_tx_power, missed_lora_packets, lora_sender_action
+ 
     
-    
-
 
 def cb(events):
-    global lora_sx, cats_status, lora_rssi
+    """Function called by the LoRa interrupt."""
+    
+    global lora_rssi, lora_rssi_sender, toa_us
 
     if events & SX1262.RX_DONE:
         msg, err = lora_sx.recv()
@@ -400,8 +397,17 @@ def cb(events):
         lora_rssi = lora_sx.getRSSI()
         msg = msg.decode("utf-8")
 #         print('Received: {}, LoRa RSSI:{}, {}'.format(msg, lora_rssi, error))
-        if msg == "ck":
+        if msg[:2] == "ck":
             lora_sx.send(bytes(str(cats_status), 'utf-8'))
+            toa_us = lora_sx.getTimeOnAir(len(cats_status))
+        
+        # check if any LoRa rssi signal feedback from the sender
+        if msg[-1] == "<":           # case the sender adds "<" after "ck"
+            lora_rssi_sender = 0     # lora_rssi_sender set to zero (=weak)
+        elif msg[-1] == ">":         # case the sender adds ">" after "ck"
+            lora_rssi_sender = 1     # lora_rssi_sender set to 1 (=strong)
+        else:                        # case no "<" or ">" added to after "ck"
+            lora_rssi_sender = None  # lora_rssi_sender set
 
     elif events & SX1262.TX_DONE:
 #         print(f"sent cats_status: {cats_status}\n")
@@ -409,8 +415,9 @@ def cb(events):
 
 
 
-# Get reset reason
 def get_reset_reason():
+    """Checks the reason for the MCU boot, in essence what happened at the power off (WDT, DeepSleep, etc)."""
+    
     import machine
     reset_reason = machine.reset_cause()  # Get reset cause
     
@@ -427,6 +434,8 @@ def get_reset_reason():
   
 
 def display_backlight_on():
+    """Set the oled didplay backlight ON"""
+    
     global oled_brightness, bright_level
     PWM(Pin(config['oled_display']['oled_backlight_pin']),
         freq=2445,
@@ -435,6 +444,8 @@ def display_backlight_on():
         
         
 def display_backlight_off():
+    """Set the oled didplay backlight ON"""
+    
     global oled_backlight
     PWM(Pin(config['oled_display']['oled_backlight_pin']),
         freq=2445,
@@ -442,8 +453,9 @@ def display_backlight_off():
     
         
     
-# Print time and radar output to the display
 def display_flash(display, n=2):
+    """Flashes the oled display N times"""
+    
     sleep_time = 0.1
     for i in range(n):
         display_backlight_off()
@@ -460,8 +472,9 @@ def display_flash(display, n=2):
         
 
 
-# Print time and radar output to the display
 def display_plot_radar(display, radar_detection, time_now, show_time=1):
+    """Print the radar output to the oled display"""
+    
     display_backlight_on()
     
     display.fill(0)
@@ -476,16 +489,18 @@ def display_plot_radar(display, radar_detection, time_now, show_time=1):
     
 
 
-# Print time and radar output to the display
 def display_plot_time(display, time_now):
+    """Print time to the oled display."""
+    
     display_backlight_on()
     display.fill(0)
     display.text(time_now, 0, 5, 1)    
     display.show()
 
 
-# Print time and radar output to the display
+
 def display_plot_tags(display, analyzed_ble_tags, cats_names, show_time=1):
+    """Print cat name and BLE rssi to the oled display"""
     
     cats_number = len(analyzed_ble_tags)
     if cats_number > 0:
@@ -506,6 +521,8 @@ def display_plot_tags(display, analyzed_ble_tags, cats_names, show_time=1):
 
 
 def display_reset_reason(display, reset_msg):
+    """Print the MCU reset reason to the oled display."""
+    
     display.fill(0)  # Clear screen
     display.text("RESET:", 0, 20)
     display.text(reset_msg, 0, 40)
@@ -515,13 +532,19 @@ def display_reset_reason(display, reset_msg):
     display_backlight_off()
 
 
+
 def check_time(start_time_s):
+    """Return the elapsed time since arg, in text format"""
+    
     hours, remainder = divmod(utime.time() - start_time_s, 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
             
 
+
 def flash_white_led(n=2, time_s=1):
+    """Flase the white LED N times"""
+    
     for i in range(n):
         WHITE_LED_PIN.value(1)
         utime.sleep(time_s)
@@ -530,7 +553,10 @@ def flash_white_led(n=2, time_s=1):
             utime.sleep(time_s)
     
 
+
 def get_mcu_temp_str():
+    """Return the MCU temperature in string format, with a 't' in front"""
+    
     mcu_temp = mcu_temperature()
     if mcu_temp > 0 and mcu_temp < 125:
         return f"t{str(mcu_temp)},"
@@ -604,7 +630,7 @@ cats_status = no_cats_text
 
 
 # Initialize the SX1262 LoRa module
-lora_sx, initial_lora_tx_power = init_lora(config)
+lora_sx, lora_tx_power, initial_lora_tx_power = init_lora(config)
 
 
 # Activate BLE
@@ -631,8 +657,8 @@ mcu_temp = mcu_temperature()
 print(f"mcu_temp: {mcu_temp} degC\n")
     
 
-# initial runs counter is set to MCU_TEMP_RUN_CADENCE
-run = MCU_TEMP_RUN_CADENCE
+# initial runs counter is set to MCU_TEMP_RUN_CADENCE + 5
+run = MCU_TEMP_RUN_CADENCE + 5
 
 
 # initial time reference 
@@ -643,18 +669,16 @@ radar_sensed_time_ms = -1000 * radar_keep_signal_period_s # last time the radar 
 
 
 
-   
 print(f"\n{'#' * 60}")
 n = max(0, 9 - len(str(radar_ignor_period_s)))
 print(f"{'#' * 8}   Stationary device: idle for {radar_ignor_period_s} secs ...   {'#' * n}")
 print(f"{'#' * 60}\n")
 
 
-
 # prepend 'd' to cats_status to 'd'eactivate the cats_status interpretation at the portable device
 # add mcu_temperature, that looks like "t44,"
 # remaining info are cats related
-cats_status = "d" + get_mcu_temp_str()  + no_cats_text  # 'd' means the radar is temporarily "d"isabled
+cats_status = f"d{get_mcu_temp_str()}{no_cats_text}" # 'd' means the radar is temporarily "d"isabled
 
 
 # intertaining print to terminal while the idle period (radar_ignor_period_s) elapses 
@@ -662,16 +686,23 @@ dot = 0
 while utime.time() < start_time_s + radar_ignor_period_s:
     if WDT_ENABLED:                   # case the WDT_ENABLED is set True
         wdt.feed()                    # Reset the watchdog timer
+    
     print('.', end='')
     dot += 1
-    if dot >= 60:
+    
+    if dot <= 30:
+        # update cat status with MCU temp; 'd' means the radar is temporarily "d"isabled
+        cats_status = f"d{get_mcu_temp_str()}{no_cats_text}"
+    elif dot > 30 and dot < 60:
+        cats_status = f"d{no_cats_text}" # update cat status without MCU temp; 'd' means the radar is temporarily "d"isabled
+    elif dot >= 60:
         dot = 0
         print()
     utime.sleep(1)
+    
 print("\n"*2)
 
-
-cats_status = get_mcu_temp_str() + no_cats_text   # cats_status is reset to its default status
+cats_status = f"d{no_cats_text}"       # update cat status without MCU temp; 'd' means the radar is temporarily "d"isabled
 start_time_s = utime.time()            # epoch time from RTC of the board is assigned to start_time_s
 start_time_ms = utime.ticks_ms()       # time in milliseconds since booting
 last_radar_check_ms = utime.ticks_ms() # time in milliseconds since booting
@@ -736,11 +767,13 @@ while True:                       # infinite loop
             if run >= MCU_TEMP_RUN_CADENCE and run <= 4 + MCU_TEMP_RUN_CADENCE:  # case to share temperature
                 cats_status = get_mcu_temp_str() + no_cats_text # mcu_temp is prepend to no_cats
             else:                                    # case the iteration < threshold
-                cats_status = no_cats_text           # onlt no_cats is assigned to cats_status
-            
+                cats_status = no_cats_text           # only no_cats is assigned to cats_status
+            cats_status += lora_sender_action        # add indication for lora power adjustment at sender
+                
+                
             last_radar_check_ms = utime.ticks_ms()   # current time in ms is assigned to last radar check ms
             time_now = check_time(start_time_s)      # current time (string format) is assigned to time_now
-            print(f"{time_now}   lora RSSI:{lora_rssi}   lora_tx_power:{lora_tx_power}   cats_status:{cats_status}")
+            print(f"{time_now}   lora RSSI:{lora_rssi}   lora_tx_power:{lora_tx_power}   cats_status:{cats_status}   ToA:{toa_us}us")
             if oled_disp_enabled:                    # case oled display is enabled
                 display_plot_radar(display, radar_detection, time_now, show_time=5) # plots some info
                 display_backlight_off()              # oled display backlight is set off
@@ -767,7 +800,8 @@ while True:                       # infinite loop
                 for cat in cats_idx:                 # iteration for the number on cats
                     cats_status += str(cat) + "0" + "," # a zero is assigned to each cat idx
                 cats_status = cats_status[:-1]       # last comma is removed
-                print(f"{time_now}   lora RSSI:{lora_rssi}   lora_tx_power:{lora_tx_power}   cats_status:{cats_status}")
+                cats_status += lora_sender_action    # add indication for lora power adjustment at sender
+                print(f"{time_now}   LoRa RSSI:{lora_rssi}   lora_tx_power:{lora_tx_power}   cats_status:{cats_status}   ToA:{toa_us}us")
             
             else:                                    # case at least one cat was in ble range
                 for cat, data in analyzed_ble_tags.items():  # iteration over the detected ble tags
@@ -775,8 +809,9 @@ while True:                       # infinite loop
                     # a string with cat idx + 1 + ble rssi is assigned
                     cats_status += str(cat) + str(data[0]) + str(data[1]) + "," 
                 cats_status = cats_status[:-1]       # last comma is removed
+                cats_status += lora_sender_action    # add indication for LoRa power adjustment at sender
                 
-                print(f"{time_now}   lora RSSI:{lora_rssi}   lora_tx_power:{lora_tx_power}   cats_status:{cats_status}")
+                print(f"{time_now}   LoRa RSSI:{lora_rssi}   lora_tx_power:{lora_tx_power}   cats_status:{cats_status}   ToA:{toa_us}us")
                 
                 last_radar_check_ms = utime.ticks_ms() # time reference in ms of last radar check
                 
@@ -785,14 +820,12 @@ while True:                       # infinite loop
                     display_backlight_off()          # oled display backlight is set off
         
         # check and eventually adjust the loRa trasnmission power
-        lora_rssi_values, lora_tx_power, missed_lora_packets = adjust_lora_tx_power(lora_sx,
-                                                                                    initial_lora_tx_power,
-                                                                                    lora_rssi,
-                                                                                    lora_rssi_values,
-                                                                                    lora_tx_power,
-                                                                                    missed_lora_packets)
+        lora_tx_power, missed_lora_packets, lora_sender_action = adjust_lora_tx_power(lora_rssi_sender,
+                                                                                      lora_tx_power,
+                                                                                      missed_lora_packets)
         
-        # preventing adjustments based on old lora_rssi values
+        
+        # preventing LoRa power adjustments based on old lora_rssi values
         lora_rssi = None    # set lora_rssi to None
         
         
