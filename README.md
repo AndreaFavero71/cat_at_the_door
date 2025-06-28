@@ -96,7 +96,7 @@ Here's how it works:
 4. If no reply is received after 15 failures:
    - It resets the transmission power to the default value, assuming the peer is off.
 
-> This simple yet effective mechanism helps conserve battery life without compromising reliability—even across multiple concrete walls or floors.
+> This simple yet effective mechanism helps conserve battery life without compromising reliabile communication.
 
 
 
@@ -139,7 +139,7 @@ All build instructions, tuning tips, and troubleshooting steps are in the downlo
 While the system works reliably with proper setup, it’s important to be aware of its current limitations:
 
 - **Radar sensitivity to movements (its own job :smile:)**  
-  If the radar moves, it detects movement; The portable device should not move.  
+  If the radar moves, it detects movement; The stationary device should not move.  
   The mmWave radar may detect raindrops as movements.
 
 - **Radar tuning is essential**  
