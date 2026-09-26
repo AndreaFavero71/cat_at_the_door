@@ -13,8 +13,8 @@ It’s ideal if:
 - You want to be notified the moment your cat is ready to come back in.
 
 This project uses two devices communicating via **LoRa**:
-- A **stationary unit** with radar + BLE detection, placed inside near the door.
-- A **portable unit** with e-paper display + buzzer, that you carry with you.
+- A **stationary device** with radar + BLE detection, placed inside near the door.
+- A **portable device** with e-paper display + buzzer, that you carry with you.
 
 
 <br><br>
@@ -51,24 +51,26 @@ MACCHIA, one of our cats, comes back home after wandering in the garden for over
 <br><br>
 ## Required hardware (summary)
 
-| Qty | Component                            | Notes |
-|-----|--------------------------------------|-------|
-| 2   | Heltec Wi-Fi LoRa 32 V3              | With antenna + JST battery connector |
-| 1+  | Tile Sticker BLE tag (per cat)       | Use the Tile app to activate |
-| 1   | HLK TD2010C radar module             | Tuned via HLKRadarTool app |
-| 1   | 2.9" Waveshare e-paper display       | Black & white |
-| 1   | 3.7V 2200mAh LiPo battery            | For portable device |
-| 1   | Rotary encoder + push-button         | For settings menu |
-| 1   | Buzzer (3.3–5V, with transistor)     | For optional alerts |
-|     | USB-C panel mount sockets            | Power and recharging |
-|     | 3D printed case set                  | STL and STEP files provided |
-|     | Aluminum tape                        | Blocks radar from sensing inside room |
+| Qty | Component                                | Notes |
+|-----|------------------------------------------|-------|
+| 2   | Heltec Wi-Fi LoRa 32 V3                  | With antenna + JST battery connector |
+| 1+  | Holyiot NRF52810 BLE Beacon (1x per cat) | Fixed MAC address; check if battery CR2032 is included |
+| 1   | HLK TD2010C radar module                 | Tuned via HLKRadarTool app |
+| 1   | 2.9" Waveshare e-paper display           | Black & white |
+| 1   | 3.7V 2200mAh LiPo battery                | For portable device |
+| 1   | Rotary encoder + push-button             | For settings menu |
+| 1   | Buzzer (3.3–5V, with transistor)         | For optional alerts |
+| 2   | USB-C panel mount sockets                | Power and recharging |
+| 1+  | CR2032 coin battery (1x beacon)          | If the beacon doesn't come with the battery|
+|     | 3D printed case set                      | STL and STEP files provided |
+|     | Aluminum tape                            | Blocks radar from sensing inside room |
+
 > Please read the manual for full instructions before proceeding.
 
 
 <br><br>
 ## Quick start
-1. Attach a **Tile Sticker BLE tag** to your cat’s collar and retrieve its MAC address (e.g., using *nRF Connect* app)
+1. Attach a **Holyiot NRF52810 BLE Beacon** to your cat’s collar and retrieve its MAC address (e.g., using *nRF Connect* or *Holyiot-beacon* app)
 2. Flash **MicroPython** onto both Heltec Wi-Fi LoRa 32 V3 boards
 3. Upload files via **Thonny** to both boards (portable and stationary)
 4. Edit `ble_tags.json` and `config.json` with your own settings
@@ -96,7 +98,7 @@ Here's how it works:
 4. If no reply is received after 15 failures:
    - It resets the transmission power to the default value, assuming the peer is off.
 
-> This simple yet effective mechanism helps conserve battery life without compromising reliabile communication.
+> This simple yet effective mechanism helps conserve battery life without compromising reliable communication.
 
 
 
@@ -146,10 +148,11 @@ While the system works reliably with proper setup, it’s important to be aware 
   Each installation requires some trial and error. Radar positioning and threshold tuning are necessary and can take time.
 
 - **BLE Tag compatibility**  
-  Only BLE tags with fixed MAC addresses can be used. **Apple AirTags** are not compatible due to MAC address randomization.
+  Only BLE tags with fixed MAC addresses can be used.
+  **Apple AirTags** and **Tile Stickers** are not compatible, as their MAC addresses rotate for anti-tracking reasons.
 
 - **Size of BLE tag**  
-  The Tile Sticker is compact but may still feel bulky on very small cats.
+  The Holyiot NRF52810 (Ø30mm × 8mm, after removing the hanging hole) is compact but may still feel bulky on very small cats.
 
 - **Not suitable for automatic door control**  
   This project only **notifies** when your cat is outside, it does **not open** any doors or actuators.
@@ -157,7 +160,7 @@ While the system works reliably with proper setup, it’s important to be aware 
 - **Radar field of view**  
   The mmWave radar has an approximate horizontal detection angle of **60 degrees**. This is sufficient to cover a door-sized area.  
   However, if your cat tends to return from wider angles or corners not covered by this range, you may need to reposition the radar.  
-  Adding a second radar module shouldn't take too much effort, and it would surely wider the coverage.
+  Adding a second radar module shouldn't take too much effort, and it would surely widen the coverage.
 
 - **Intermediate DIY skills**  
   Basic soldering, 3D printing, and firmware flashing are required. Beginners can follow the guide, but the effort is non-trivial.

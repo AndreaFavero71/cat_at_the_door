@@ -1,8 +1,8 @@
 {
     "wifi": {
         "enable": 1,
-        "ssid": "YourSSID",
-        "password": "YourWiFiPassword"
+        "ssid": "VRV9517805DB2",
+        "password": "CWY@h75Xac5d"
     }
 
     "time": {
@@ -26,7 +26,8 @@
 
     "system": {
         "timeout_m": 150,
-        "lora_interval_s": 15
+        "lora_interval_s": 15,
+        "epd_full_refresh_every_n": 60
     }
 
     "oled_display": {
@@ -55,4 +56,5 @@
         "code_rate": 7,
         "duty_cycle_percent":1.0
     }
+    
 }

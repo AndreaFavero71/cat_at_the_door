@@ -1,10 +1,8 @@
 """
-Andrea Favero, 20250608
+Andrea Favero, 20250608   (rev 0.3 20260926)
 
 'Door at the door' project
 Code for the portable device
-Rev 0.2
-
 
 Hardware:
 - Heltec WiFi LoRa 32 V3 board (based on ESP32-S3)
@@ -33,7 +31,7 @@ Energy:
 
 
 EPD Display:
-- LoRa icon, if latest coomunication was established, and signal strenght.
+- LoRa icon, if la coomunication was established, and signal strenght.
 - WiFi icon, if latest WiFI connection was established.
 - Battery icon, with charge level periodically checked on the battery voltage.
 - Bel icon if enabled, and related number of buzzer repeats
@@ -46,6 +44,31 @@ EPD Display:
 Config:
 - Most of the settings in config.json file.
 - Cats'names and related ble mac addresses in ble_tags.json
+
+
+
+20250923 rev 0.4:
+1) Corrected slicing bug when parsing “<” or “>” from the LoRa payload.
+2) Corrected bug: show_ack_epd now receives show_time (previously received
+   lora_iterations, causing the ack display to sleep for the full iteration
+   count and trip the WDT once past ~60 cycles).
+3) Corrected bug: show_ack_epd now calls clear_epd with arguments.
+4) Removed duplicated reset variables after acknowledgment.
+5) Changed to EPD partial update, with periodic EPD full refresh
+   (epd_full_refresh_every_n in config.json).
+6) Hold the EPD control pins (CS/DC/RST) across MCU lightsleep, and release
+   them on wake, so EPD partial refresh survives the power-down.
+6) Added explicit periodic gc.collect() calls to prevent heap exhaustion.
+
+
+20250615 rev 0.3:
+1) SCAN moved from header_EPD to show_EPD
+2) battery voltage more robust at the start
+3) battery level shifted a bit toward high
+
+
+Rev 0.2: removed bug on battery_voltage_list growing indefinetely, revised battery_level
+
 """
 
 
@@ -61,6 +84,21 @@ print(f"{'#' * 60}\n")
 
 
 
+
+
+
+###########################################################################################
+# System controls #########################################################################
+###########################################################################################
+
+# enabling prints to the Shell
+verbose = False
+
+# setting for the Watch Dog Timer
+WDT_ENABLED = True
+
+
+
 ###########################################################################################
 # EPD library import and fast feedback on display #########################################
 ###########################################################################################
@@ -71,13 +109,33 @@ with open("lib/welcome_icon.bin", "rb") as f:       # opens the binary file with
     welcome_icon = bytearray(f.read())              # makes a bytearray from the image
 
 epd = EPD(width=128, height=296, orientation=90)    # valid orientations are 0, 90 and 180
-epd.init_Fast()           # wake the epd up from sleep
-epd.buffer = welcome_icon # fills the framebuffer with the welcome_icon
-epd.get_buffer()          # rotates buffer and send it to EPD (portrait write to EPD, taking ca 60ms)
-epd.display()             # plots the buffer to the display (takes ca 1.8 secs)
-epd.sleep()               # prevents display damages on the long run (command takes ca 100ms)
 
-welcome_icon = None       # release welcome_icon to free up some memory 
+epd.init_Fast()             # wake the epd up from sleep
+epd.buffer = welcome_icon   # fills the framebuffer with the welcome_icon
+epd.display(epd.get_buffer())  # plots the buffer to the display (takes ca 1.8 secs)
+epd.sleep()                 # prevents display damages on the long run (command takes ca 100ms)
+
+welcome_icon = None         # release welcome_icon to free up some memory 
+
+
+
+###########################################################################################
+# Memory check and clean ##################################################################
+###########################################################################################
+import gc
+
+def clean_mem():
+    """Function to clean the memory."""
+    
+    mem_alloc_1 = gc.mem_alloc()
+    mem_free_1 = gc.mem_free()
+    gc.collect()
+    mem_alloc_2 = gc.mem_alloc()
+    print(f"Allocated mem: before ({mem_alloc_1}) and after gc.collect ({mem_alloc_2}), recovered {mem_alloc_1-mem_alloc_2}")
+    print(f"Free mem: before ({mem_free_1}) and after gc.collect ({gc.mem_free()})\n")
+
+# force a memory cleaning cycle
+clean_mem()
 
 
 
@@ -88,7 +146,7 @@ welcome_icon = None       # release welcome_icon to free up some memory
 from machine import Pin, ADC, PWM, RTC, Timer, deepsleep, lightsleep, WDT, SoftI2C
 from machine import reset_cause, PWRON_RESET, HARD_RESET, WDT_RESET, DEEPSLEEP_RESET, SOFT_RESET
 
-import sys, network, ntptime, json, ubluetooth, gc, ssd1306, utime, struct
+import sys, network, ntptime, json, ubluetooth, ssd1306, utime, struct
 
 from datetime_converter import DateTimeConverter    # date time conversion w/wo internet
 from rotary_irq_esp import RotaryIRQ   # import for the encoder knob
@@ -101,21 +159,14 @@ from writer import Writer              # library for text
 import helvetica22bold                 # import for edp display
 import helvetica26bold                 # import for edp display
 
-
-
-###########################################################################################
-# System controls #########################################################################
-###########################################################################################
-
-# setting for the Watch Dog Timer
-WDT_ENABLED = True
+# force a memory cleaning cycle
+clean_mem()
 
 
 
 ###########################################################################################
 # Constants ###############################################################################
 ###########################################################################################
-
 
 # hardware setup for rotary Encoder
 PUSH_BUTTON = Pin(4, Pin.IN, Pin.PULL_UP)  # pin for the push button of the encode
@@ -178,10 +229,11 @@ wifi_enabled = False                # this variable gets updated from the config
 
 
 # push button settings
-debounce_timer = Timer(0)           # timer-based debounce
-push_button_block_timer = Timer(1)  # a second timer for the bush button debouncing
-push_button_blocked = False         # flag to prevent repeated triggers
-button_pressed = False              # flag to track if the encoder push button is pressed
+BUTTON_DEBOUNCE_MS = 50             # was debounce_timer, 50 ms
+BUTTON_BLOCK_MS    = 200            # was push_button_block_timer, 200 ms
+button_edge_ms     = 0              # ticks_ms of the last falling edge (set by IRQ)
+button_last_ms     = 0              # ticks_ms of the last accepted press (set by main loop)
+button_pressed     = False          # flag consumed by the main loop
 
 
 # variables related to LoRa communication
@@ -222,6 +274,9 @@ last_battery_check_time = 0         # initialize variable holding the last batte
 wifi_connected = False              # flag to track the wifi connection status
 oled_display_menu = False           # flag to track when dealing with the menu on screen
 
+# EPD refresh bookkeeping
+partial_refresh_count = 0           # partial refreshes since the last full refresh
+epd_full_refresh_every_n = 60       # full refresh when count reaches this (updated from config.json)
 
 # mcu temperature of portable device is used as initial mcu temp of the stationary device
 last_stat_mcu_temp = mcu_temperature()
@@ -447,11 +502,11 @@ def init_lora(config):
 
     print("Activating LoRa ...")
     
-    lora_tx_power = int(config['lora']['tx_power'])  # TX power in dBm
-    initial_lora_tx_power = lora_tx_power
-    print(f"Initial LoRa transmission power: {lora_tx_power} dB")
-    
     try:
+        lora_tx_power = int(config['lora']['tx_power'])  # TX power in dBm
+        initial_lora_tx_power = lora_tx_power
+        print(f"Initial LoRa transmission power: {lora_tx_power} dB")
+        
         lora_sx = SX1262(spi_bus = int(config['lora']['spi_bus']),
                      clk =     Pin(int(config['lora']['clk_pin'])),
                      mosi =    Pin(int(config['lora']['mosi_pin'])),
@@ -639,7 +694,7 @@ def lora_callback(events):
         if error == "ERR_NONE":
             cats_status = msg.decode("utf-8")
             lora_connect_counter += 1
-            print(f"query: {query} ; ToA:{toa_us//1000}ms ; LoRa power:{lora_tx_power} ; LoRa RSSI:{lora_rssi} ; cats_status: {cats_status}")
+            print(f"\nquery: {query} ; ToA:{toa_us//1000}ms ; LoRa power:{lora_tx_power} ; LoRa RSSI:{lora_rssi} ; cats_status: {cats_status}")
         else:
             print("LoRa conection error")
 
@@ -651,6 +706,7 @@ def lora_callback(events):
 
 def read_battery_voltage(adc_avg=0, bat_voltage=0):
     """Monitor the battery voltage"""
+    t_ref = utime.ticks_ms()
     try:
         ADC_CTRL.value(1)              # Enable battery voltage measurement
         utime.sleep_ms(20)             # Stabilization delay
@@ -659,7 +715,7 @@ def read_battery_voltage(adc_avg=0, bat_voltage=0):
 
         for _ in range(VBAT_READINGS): # Iterating VBAT_READINGS times
             adc_avg += adc_bat.read()  # Adds raw ADC value (0-4095) for VBAT_READINGS times
-            utime.sleep_ms(5)          # Short sleep time
+            utime.sleep_ms(10)         # Short sleep time
 
         adc_avg /= (VBAT_READINGS + 1) # average the VBAT_READINGS readings
         bat_voltage = CORRECTION * (adc_avg / 4095) * V_REF * DIVIDER_RATIO # convertion to batt voltage and correction
@@ -680,8 +736,8 @@ def get_battery_percentage(voltage):
     Returns:
         int: The battery percentage that best matches the voltage.
     """
-    voltage_levels = [4.1, 3.93, 3.82, 3.75, 3.7, 3.65, 3.6]
-    percent_levels = [100, 80,   60,   40,   20,  10,   0]
+    voltage_levels = [3.98, 3.88, 3.82, 3.74, 3.7, 3.65, 3.6]
+    percent_levels = [ 100,   80,   60,   40,  20,   10,   0]
 
     # Find the index of the voltage level closest to the measured voltage
     closest_index = min(range(len(voltage_levels)), key=lambda i: abs(voltage - voltage_levels[i]))
@@ -689,12 +745,14 @@ def get_battery_percentage(voltage):
 
 
 
-def check_battery(now, battery_voltage, battery_voltage_list, battery_level, last_battery_check_time,
-                  BATTERY_CHECK_INTERVAL_S, first_time = False):
-
-    if first_time or now > last_battery_check_time + BATTERY_CHECK_INTERVAL_S:
-        battery_voltage = round(read_battery_voltage(),2) # battery voltage is measured   
-        battery_voltage_list.append(battery_voltage)
+def check_battery(now, battery_voltage, battery_voltage_list, battery_level,last_battery_check_time,
+                  BATTERY_CHECK_INTERVAL_S, force_battery_check = False):
+        
+    if force_battery_check or now > last_battery_check_time + BATTERY_CHECK_INTERVAL_S:
+        repeats = 5 if force_battery_check else 1
+        for i in range(repeats):
+            battery_voltage = round(read_battery_voltage(),2) # battery voltage is measured   
+            battery_voltage_list.append(battery_voltage)
         
         if len(battery_voltage_list) > 1:
             battery_voltage = sum(battery_voltage_list) / len(battery_voltage_list)
@@ -710,39 +768,14 @@ def check_battery(now, battery_voltage, battery_voltage_list, battery_level, las
 
 
 
-def check_encoder(last_encoder_value, oled_display_menu):
-    encoder_value = rotary.value()
-    if encoder_value != last_encoder_value:
-        print("Rotary Encoder Value:", encoder_value)
-        last_encoder_value = encoder_value
-        oled_display_menu = True
-    return encoder_value, last_encoder_value, oled_display_menu
-
-
-
-def unblock_push_button(timer):
-    global push_button_blocked
-    push_button_blocked = False  # Allow new triggers after 200ms
-
-
-
-def debounced_handler(timer):
-    global push_button_blocked, button_pressed
-    if PUSH_BUTTON.value() == 0 and not push_button_blocked:  # Ensure button is still pressed & not push_button_blocked
-        button_pressed = True
-        print("Button Pressed!")
-        push_button_blocked = True  # Block further presses
-        push_button_block_timer.init(mode=Timer.ONE_SHOT, period=200, callback=unblock_push_button)  # unblock_push_button after 200ms
-
-
-
 def btn_pressed(pin):
-    if not push_button_blocked:  # Ignore if push_button_blocked
-        debounce_timer.init(mode=Timer.ONE_SHOT, period=50, callback=debounced_handler)  # Debounce
+    """Hard IRQ: record the edge timestamp."""
+    global button_edge_ms
+    button_edge_ms = utime.ticks_ms()
 
 
 
-# # Initialize I2C for the OLED display
+# Initialize I2C for the OLED display
 def get_i2c(config):
     print("Activating I2C function ...")
     from machine import SoftI2C
@@ -777,6 +810,9 @@ def analyze_cats_status(cats_status):
     > means the receiver gets a strong rssi signal
     """
 
+    if verbose:
+        print(f"Raw cats_status: {cats_status}")
+    
     at_the_door = []                            # empty list to store cats name when at the door
     lbe_rssi = []                               # empty list to store lbe rssi when at the door
     detected = cats_status.replace(" ", "")     # cats_status is assigned to local variable detected
@@ -785,20 +821,28 @@ def analyze_cats_status(cats_status):
     
     if detected[-1] == '<':                     # case detected ends with 'r'
         lora_rssi_sender = 0                    # rssi level of the receiver set to 0 (=weak)
-        detected = detected[-1]                 # last character is removed from detected
+        detected = detected[:-1]                # last character is removed from detected
 
     elif detected[-1] == '>':                   # case detected ends with '>'
         lora_rssi_sender = 1                    # rssi level of the receiver set to 1 (=strong)
-        detected = detected[-1]                 # last character is removed from detected
+        detected = detected[:-1]                # last character is removed from detected
         
     if detected[0] == 'r':                      # case detected starts with 'r'
         detected = detected[1:]                 # initial 'r' is removed to detected
+        if verbose:
+            print("Radar detection: True")
+    else:
+        if verbose:
+            print("Radar detection: False")
     
     if detected[0] == 't':                      # case sliced detected starts with 't'
         comma_pos = detected.find(",")          # position of first comma in string
         stat_mcu_temp = detected[1 : comma_pos] # string with the stationary mcu temperature
         detected = detected[1 + comma_pos :]    # detected is liced by removing stat mcu temp
+        if verbose:
+            print(f"Stationary device temperature: {stat_mcu_temp}")
     
+    cats_number = 0                             # assumption of no cats
     if detected.count(',') > 0:                 # at least 2 cats
         cats_number = detected.count(',') + 1   # number of cats
     else:                                       # one or zero cats
@@ -806,7 +850,6 @@ def analyze_cats_status(cats_status):
             cats_number = 1                     # 1 cat
         else:                                   # less than 2 characters
             cats_number = 0                     # no cats
-            
     
     for idx in range(cats_number):              # iteration for the number of cats
         if ',' in detected:                     # case there is a comma in detected
@@ -832,6 +875,10 @@ def analyze_cats_status(cats_status):
             
             # the return break the iteration
             return at_the_door, lbe_rssi, stat_mcu_temp, lora_rssi_sender
+    
+    if verbose:
+        print("at_the_door, lbe_rssi, stat_mcu_temp, lora_rssi_sender")
+        print(at_the_door, lbe_rssi, stat_mcu_temp, lora_rssi_sender )
         
     # return the empty lists when no cats at the door
     return at_the_door, lbe_rssi, stat_mcu_temp, lora_rssi_sender 
@@ -844,6 +891,7 @@ def stop_beep(buzzer_timer=None):
     BUZZER.duty_u16(65535)  # Transistor OFF
     if buzzer_timer:
         buzzer_timer.deinit()
+
 
 def start_beep(duration_ms=200, freq=1000, volume=5):
     """Start a beep with auto-stop. Adaptive volume on frequency."""
@@ -867,37 +915,77 @@ def activate_buzzer():
         period = 150 + i*10
         start_beep(duration_ms=50+i*10, freq=700, volume=buzzer_volume)
         utime.sleep_ms(period)
-    
-    
-    
-def clean_mem():
-    """Function to clean the memory"""
-    
-    print("gc.mem_alloc():", gc.mem_alloc())
-    print("gc.mem_free():" , gc.mem_free())
-    gc.collect()
-    utime.sleep(5)
-    print("gc.mem_alloc():", gc.mem_alloc())
-    print("gc.mem_free():" , gc.mem_free())
-    print()
+ 
 
 
 
 def get_display_epd(epd):
-    """Function preparing a Display oject based on Framebuffer."""
+    """Prepares the framebuffer and returns a Display view."""
     
-    epd.init_Fast()     # wake the epd up from sleep
-    epd.new_buffer()    # makes a new HLSB buffer (protrait display orientation ...)
-    epd.fb.fill(0xff)   # generates the white background (epd works inverted)
+    h = epd.height
+    w = epd.width
+#     epd.init_Fast()     # wake the epd up from sleep
+    epd.new_buffer(h, w)  # makes a new buffer
+    epd.fb.fill(0xff)     # generates the white background (epd works inverted)
     
     # Display framebuffer is needed for the Writer
-    return Display(epd.height, epd.width, epd.buffer)  # note it uses VLSB
+    return Display(h, w, epd.buffer)  # note it uses VLSB
 
 
 
 
-def header_epd(epd, display_epd, lora_connect_status, wifi_connected, battery_level, date_time,
-               last_stat_mcu_temp, lora_iterations, second_row=True):
+def flush_epd(epd, force_full=False, source=None):
+    """
+    Sends the current framebuffer to the EPD.
+    Uses partial refresh normally, and a full refresh every
+    'epd_full_refresh_every_n' partial updates (or when forced).
+    Returns True if a full refresh was performed.
+    """
+    global partial_refresh_count
+    
+    h = epd.height
+    w = epd.width
+    do_full = force_full or (partial_refresh_count >= epd_full_refresh_every_n)
+
+    if do_full:
+        if verbose:
+            if source is None:
+                print("EPD full refresh")
+            else:
+                print(f"EPD full refresh, source: {source}")
+        clean_mem()
+        
+        # init the EPD, leading to full refresh, and EPD readiness for Partial updates
+        epd.init()
+        epd.Clear()
+        
+        # clean the memory, as the EPD init is quite mem intensive
+        clean_mem()
+        
+        partial_refresh_count = 0
+        
+    else:
+        if verbose:
+            if source is None:
+                print("EPD Partial update")
+            else:
+                print(f"EPD Partial update, source: {source}")
+        
+        partial_refresh_count += 1
+    
+    
+    epd.display_Partial(epd.get_buffer(), x=0, y=0, w=w, h=h)
+    utime.sleep(0.5)
+    epd.sleep()          # force EPD into deepsleep 
+
+    return do_full
+
+
+
+
+
+def header_epd(epd, display_epd, lora_connect_status, wifi_connected, battery_level,
+               date_time, last_stat_mcu_temp, second_row=True):
     """
     Plots the one or two headers rows on the EPD display.
     The plotted infor are informative about the system.
@@ -972,22 +1060,8 @@ def header_epd(epd, display_epd, lora_connect_status, wifi_connected, battery_le
         wri = Writer(display_epd, helvetica22bold, verbose=False)
         wri.printstring(temp_txt, invert=True)     # plot the string
         
-        # plot the LoRa connections counter
-        connections_txt = f"SCAN {lora_iterations}"  # string with the lora_iterations
-        if not lora_connect_status:                # case the (last) LoRa connection fails
-            connections_txt += "(NO LoRa)"         # a note is added to the text message
-        
-        #AF
-        connections_txt += " dB " + str(lora_tx_power)
-        #AF
-        
-        Writer.set_textpos(display_epd, 105, 0)    # writer coordinates first y then x
-        wri = Writer(display_epd, helvetica22bold, verbose=False)
-        wri.printstring(connections_txt, invert=True)
-        
     
     # drawing separation lines after icons and text (prevent lines to be overwritten)
-    
     # horizontal lines separating the first "row" of the display from the rest
     epd.hline(0, 25, 297, 0x00)           # plot the horizontal line
     
@@ -1007,9 +1081,9 @@ def header_epd(epd, display_epd, lora_connect_status, wifi_connected, battery_le
 
 
     
-def show_info_epd(epd, wifi_connected, battery_level, date_time, last_stat_mcu_temp,
-                  radar_detection, cats_at_the_door, cat_at_door_reminder,
-                  cat_at_door_time, cats_lbe_rssi, lora_iterations):
+def show_info_epd(epd, lora_connect_status, wifi_connected, battery_level, date_time,
+                  last_stat_mcu_temp, radar_detection, cats_at_the_door, cat_at_door_reminder,
+                  cat_at_door_time, cats_lbe_rssi, battery_voltage):
     
     """
     Recall the one or two headers rows on the EPD display.
@@ -1025,81 +1099,126 @@ def show_info_epd(epd, wifi_connected, battery_level, date_time, last_stat_mcu_t
     # number of cats
     cats_number = len(cats_at_the_door)                  # number of detected cats (via ble tags)
     
-    # plot a cat icon when the radar detects something and ninfo not yet aknowledged
-    if radar_detection:  # case the radar detects (likely) a cats
-        display_epd.blit(Icons.cat_icon_fb, 0, 32)       # plots cat icon to the VLSB frame (it takes ca 60ms)
-        plt_2nd_row = False                              # the second header row is not plotted
+    # case the the ventual cats presence has not been aknowledged
+    if not (cat_at_door_reminder and utime.time() > cat_at_door_time + radar_min_signal_time_s):
+        
+        # plot a cat icon when the radar detects something and ninfo not yet aknowledged
+        if radar_detection:  # case the radar detects (likely) a cats
+            display_epd.blit(Icons.cat_icon_fb, 0, 32)       # plots cat icon to the VLSB frame (it takes ca 60ms)
+            plt_2nd_row = False                              # the second header row is not plotted
     
-    # updates cats names and BLE signal strenght
-    if cats_number > 0:                                  # case there is at least one cat
-        plt_2nd_row = False                              # the second header row is not plotted
+        # updates cats names and BLE signal strenght
+        if cats_number > 0:                                  # case there is at least one cat
         
-        wri = Writer(display_epd, helvetica26bold, verbose=False) # writer coordinates first y then x               
-        
-        # variables to center the cats namea on the display
-        font_size = 26                                   # font size
-        min_y = 28                                       # min y position to preserve the header
-        max_y = 128 - font_size                          # max y position for the text to prevent overflow
-        
-        # in case of (too) many cats, the text fill partially overlap
-        if cats_number * font_size > font_size + max_y - min_y and cats_number > 1:
-            font_size = int((font_size + max_y - min_y) / cats_number)
-        
-        # y gap in between the text rows, to equally distribute it in y direction
-        y_gap = ((font_size + max_y - min_y) - cats_number * font_size) / cats_number
-        
-        row = 0                                          # set the initial row reference for the first 
-        for idx, cat in enumerate(cats_at_the_door):     # iterates over the cats_at_the_door list of names
-            y = int(min_y + y_gap/2 + row * (font_size + y_gap)) # y coordinate is calculated
-            y = max(min_y, min(max_y, y))                # y coordinated is clamped between min and max
+            plt_2nd_row = False                              # the second header row is not plotted
             
-            Writer.set_textpos(display_epd, y, 85)       # defines the text position
-            wri.printstring(cat, invert=True)            # print the cat name
+            wri = Writer(display_epd, helvetica26bold, verbose=False) # writer coordinates first y then x               
             
-            if len(cats_lbe_rssi) == cats_number:        # check cats_lbe_rssi coherence with cats_number
-                Writer.set_textpos(display_epd, y, 240)  # defines the text position
-                wri.printstring(str(cats_lbe_rssi[idx]), invert=True)  # print the cats_lbe_rssi
-            row += 1                                     # increase the row reference
+            # variables to center the cats namea on the display
+            font_size = 26                                   # font size
+            min_y = 28                                       # min y position to preserve the header
+            max_y = 128 - font_size                          # max y position for the text to prevent overflow
+            
+            # in case of (too) many cats, the text fill partially overlap
+            if cats_number * font_size > font_size + max_y - min_y and cats_number > 1:
+                font_size = int((font_size + max_y - min_y) / cats_number)
+            
+            # y gap in between the text rows, to equally distribute it in y direction
+            y_gap = ((font_size + max_y - min_y) - cats_number * font_size) / cats_number
+            
+            row = 0                                          # set the initial row reference for the first 
+            for idx, cat in enumerate(cats_at_the_door):     # iterates over the cats_at_the_door list of names
+                y = int(min_y + y_gap/2 + row * (font_size + y_gap)) # y coordinate is calculated
+                y = max(min_y, min(max_y, y))                # y coordinated is clamped between min and max
+                
+                Writer.set_textpos(display_epd, y, 85)       # defines the text position
+                wri.printstring(cat, invert=True)            # print the cat name
+                
+                if len(cats_lbe_rssi) == cats_number:        # check cats_lbe_rssi coherence with cats_number
+                    Writer.set_textpos(display_epd, y, 240)  # defines the text position
+                    wri.printstring(str(cats_lbe_rssi[idx]), invert=True)  # print the cats_lbe_rssi
+                row += 1                                     # increase the row reference
     
     
-    # reminder remaining on screen after aknowledging the cat presente
     # case the cats presence has been aknowledged
-    if cat_at_door_reminder and utime.time() > cat_at_door_time + radar_min_signal_time_s:
+    # reminder remaining on screen after aknowledging the cat presente
+    else:
+        
+        plt_2nd_row = False                              # the second header row is not plotted
+        
         Writer.set_textpos(display_epd, 70, 10) 
         wri = Writer(display_epd, helvetica22bold, verbose=False)
         wri.printstring("REMEMBER THE CAT(S) ?", invert=True)
     
+    
+    if plt_2nd_row:
+        
+#         ##############################################################################
+#         ##############################################################################
+#         Writer.set_textpos(display_epd, 80, 0)    # writer coordinates first y then x
+#         wri = Writer(display_epd, helvetica22bold, verbose=False)
+#         wri.printstring(str(battery_voltage), invert=True)
+#         ##############################################################################
+#         ##############################################################################
+        
+        
+        # plot the LoRa connections counter
+        connections_txt = f"SCAN {lora_iterations}"  # string with the lora_iterations
+        if not lora_connect_status:                # case the (last) LoRa connection fails
+            connections_txt += "(NO LoRa)"         # a note is added to the text message
+        
+        # plot the LoRa tx_power level used
+        if lora_tx_power is not None:
+            connections_txt += "  dB " + str(lora_tx_power)
+        
+        Writer.set_textpos(display_epd, 105, 0)    # writer coordinates first y then x
+        wri = Writer(display_epd, helvetica22bold, verbose=False)
+        wri.printstring(connections_txt, invert=True)
+    
+    
     # plot the first header row, eventually also the second one, with various info
     header_epd(epd, display_epd, lora_connect_status, wifi_connected, battery_level,
-               date_time, last_stat_mcu_temp, lora_iterations, second_row = plt_2nd_row)
+               date_time, last_stat_mcu_temp, second_row = plt_2nd_row)
     
-    epd.get_buffer()    # rotates the buffer to send it to the display (portrait wrinting, resulting (takes ca 60ms)
-    epd.display()       # plots the buffer to the display (takes ca 1.8 secs)
-    epd.sleep()         # prevents display damages on the long run (command takes ca 100ms)
+    # call the EPD flushing function
+    flush_epd(epd, source='show_info_epd')
 
 
 
-def show_ack_epd(epd, wifi_connected, battery_level, date_time,
-                 last_stat_mcu_temp, lora_iterations, show_time=5):
+
+
+def show_ack_epd(epd, lora_connect_status, wifi_connected, battery_level,
+                 date_time, last_stat_mcu_temp, show_time=5):
     """
     Plots an AKNOWLEDGEMENT feedback on the EPD display.
     """
-    # plots the basic info (header), like the connections icons, battery, date nd time, etc
+    
+    # discharge display_epd object for memory managment
+    display_epd = None
+    
     display_epd = get_display_epd(epd)
-    header_epd(epd, display_epd, lora_connect_status, wifi_connected,
-               battery_level, date_time, last_stat_mcu_temp, lora_iterations)
 
     wri = Writer(display_epd, helvetica26bold, verbose=False) # writer coordinates first y then x
-    Writer.set_textpos(display_epd, 68, 40)                   # defines the text position
+    Writer.set_textpos(display_epd, 60, 40)        # 68, 40    # defines the text position
     wri.printstring("AKNOWLEDGED", invert=True)               # print the ack
     
-    epd.get_buffer()    # rotates the buffer to send it to the display (portrait wrinting, resulting (takes ca 60ms)
-    epd.display()       # plots the buffer to the display (takes ca 1.8 secs)
-    epd.sleep()         # prevents display damahges on the long run (command takes ca 100ms)
+    # call the EPD flushing function
+    flush_epd(epd, source='show_ack_epd')
     
+    # discharge display_epd object for memory managment
+    display_epd = None
+    
+    # force a memory cleaning cycle
+    clean_mem()
+        
     if show_time > 0:
-        utime.sleep(show_time)  # sleep time to let the message visible
-        clear_epd               # epd display is cleared
+        t_ref = utime.time()
+        while utime.time() - t_ref < show_time:
+            utime.sleep(0.1)
+        
+#         utime.sleep(show_time)    # sleep time to let the message visible
+
+
 
 
 
@@ -1108,33 +1227,22 @@ def show_deepsleep_epd():
     """
     Plots a sleeping icon on the EPD display.
     """
-    
+
+    clean_mem()
+
     # plots deepsleep image to the EPD before before entering in deepsleep
     with open("lib/deepsleep_icon.bin", "rb") as f:       # opens the binary file with welcome bmp image
         deepsleep_icon = bytearray(f.read())              # makes a bytearray from the image
-
-    epd = EPD(width=128, height=296, orientation=0)       # valid is 0 for this image
-    epd.init()                  # wake the epd up from sleep
+    
+    epd = EPD(width=128, height=296, orientation=0)       # valid orientation is 0 for this image
+    epd.init_Fast()             # wake the epd up from sleep
     epd.buffer = deepsleep_icon # fills the framebuffer with the welcome_icon
-    epd.display()               # plots the buffer to the display (takes ca 1.8 secs)
+    clean_mem()
+    epd.display(epd.get_buffer()) # plots the deepsleep_icon framebuffer to the display (takes ca 1.8 secs)
+    utime.sleep(1)
     epd.sleep()                 # prevents display damages on the long run (command takes ca 100ms)
+    clean_mem()
     utime.sleep(5)              # sleep time ensuring the display gets updated
-    
-    
-    
-    
-    
-def clear_epd(epd, wifi_connected, battery_level, date_time):
-    """Clears the EPD display."""
-    
-    # plots the basic info (header), like the connections icons, battery, date nd time, etc
-    display_epd = get_display_epd(epd)
-    header_epd(epd, display_epd, lora_connect_status, wifi_connected, battery_level, date_time)
-    
-    epd.get_buffer()    # rotates the buffer to send it to the display (portrait wrinting, resulting (takes ca 60ms)
-    epd.display()       # plots the buffer to the display (takes ca 1.8 secs)
-    epd.sleep()         # prevents display damahges on the long run (command takes ca 100ms)
-
 
 
 
@@ -1189,10 +1297,14 @@ def goto_deepsleep():
     except:
         pass
     
-    print("\nMCU deepsleep ...\n\n")
+    print("\nPrepapring for MCU deepsleep ...\n\n")
     utime.sleep(0.5)         # short delay
     
     show_deepsleep_epd()     # epd display plots a sleeping feedback
+    
+    print("\nMCU deepsleep ...\n\n")
+    utime.sleep(1)           # short delay
+    
     deepsleep()              # device goes into deepsleep
 
 
@@ -1254,6 +1366,9 @@ dst_shift =              config["time"]["dst"]           # dst_shift = utc_shift
 duty_cycle_percent =     config["lora"]["duty_cycle_percent"]  # allowed duty-cycle in percentage (1 for 1% ; 0.1 for 0.1%)
 
 radar_min_signal_time_s = int(config["scanners"]["radar_keep_signal_period_s"])  # period (s) idling after acknowledge 'cats at the door'
+
+# cadence for EPD full refresh after n partial updates
+epd_full_refresh_every_n = int(config["system"]["epd_full_refresh_every_n"])
 
 buzzer_enabled = bool(config["buzzer"]["enable"])  # enable/disable the buzzer function
 buzzer_volume =  int(config["buzzer"]["volume"])   # buzzer volume
@@ -1328,8 +1443,16 @@ elif wifi_enabled:
         print("\nWi-Fi gets disabled")
         wifi_enabled = False
         
-        
 
+# force a memory cleaning cycle, after the function loading
+clean_mem()
+
+# force the PD init for partial updates
+epd.init()
+epd.Clear()
+
+# force a memory cleaning cycle, after the EPD init
+clean_mem()
 
 # update the date and time (when WiFi connection it uses NTP server)
 now = utime.time()
@@ -1337,13 +1460,16 @@ last_ntp_time_update = 0
 last_ntp_time_update, date_time = update_time(now, last_ntp_time_update, NTP_UPDATE_INTERVAL_S, first_time=True)
 
 
-# first check of the battery voltage and related level 
-battery_voltage, battery_voltage_list, battery_level, last_battery_check_time = check_battery(now,
-                                                                                              battery_voltage,
-                                                                                              battery_voltage_list,
-                                                                                              battery_level,
-                                                                                              last_battery_check_time,
-                                                                                              BATTERY_CHECK_INTERVAL_S)
+# first check of the battery voltage and related level
+batt_ret = check_battery(now,
+                         battery_voltage,
+                         battery_voltage_list,
+                         battery_level,
+                         last_battery_check_time,
+                         BATTERY_CHECK_INTERVAL_S,
+                         force_battery_check = True)
+battery_voltage, battery_voltage_list, battery_level, last_battery_check_time = batt_ret
+
 
 print(f"\n\n{'#' * 60}")
 print(f"{'#' * 11}    Portable device is active ...    {'#' * 12}")
@@ -1361,9 +1487,9 @@ print(f"{'#' * 60}\n")
 ################################################################################################
 ################################################################################################
 
-test = 0
 
-while True:
+
+while True:    
     
     # feed the wdt in case it is enabled
     if WDT_ENABLED:              # case the WDT_ENABLED is set True
@@ -1375,14 +1501,32 @@ while True:
     now_ms = utime.ticks_ms()    # current time in milliseconds (not referenced to the real word time)
     
     
+    if button_edge_ms:
+        if utime.ticks_diff(now_ms, button_edge_ms) >= BUTTON_DEBOUNCE_MS:
+            edge_ms = button_edge_ms
+            button_edge_ms = 0                       # consume the edge
+            if PUSH_BUTTON.value() == 0:             # still low after debounce → real press
+                if utime.ticks_diff(now_ms, button_last_ms) >= BUTTON_BLOCK_MS:
+                    button_last_ms = now_ms
+                    button_pressed = True
+                    print("Button Pressed!")         # feedback is printed to the shell
+    
+    
+    if button_pressed and cat_at_door_flag:
+        Writer.state.clear()
+        clean_mem()
+    
+    
     # check the battery voltage and level (no action when BATTERY_CHECK_INTERVAL_S is not elapsed)
-    battery_voltage, battery_voltage_list, battery_level, last_battery_check_time = check_battery(now,
-                                                                                                  battery_voltage,
-                                                                                                  battery_voltage_list,
-                                                                                                  battery_level,
-                                                                                                  last_battery_check_time,
-                                                                                                  BATTERY_CHECK_INTERVAL_S)
-
+    force_battery_check = True if battery_level <= 20 else False 
+    batt_ret = check_battery(now,
+                             battery_voltage,
+                             battery_voltage_list,
+                             battery_level,
+                             last_battery_check_time,
+                             BATTERY_CHECK_INTERVAL_S,
+                             force_battery_check)
+    battery_voltage, battery_voltage_list, battery_level, last_battery_check_time = batt_ret
 
     # check the current time and synchronize with npt (no action when NTP_UPDATE_INTERVAL_S is not elapsed)
     last_ntp_time_update, date_time = update_time(now, last_ntp_time_update, NTP_UPDATE_INTERVAL_S)
@@ -1401,17 +1545,15 @@ while True:
             cats_status = no_cats_text         # reset the cats_status
             buzzer_done = buzzer_repeats       # prevents further buzzing
             print("Aknowledged the cat_at_door presence")  # feedback is printed to the terminal
-            show_ack_epd(epd, wifi_connected, battery_level,
-                         date_time, last_stat_mcu_temp, lora_iterations) # plot info to the epd display
-        
+            show_ack_epd(epd, lora_connect_status, wifi_connected, battery_level,
+                         date_time, last_stat_mcu_temp, show_time=5) # plot info to the epd display
+            
         
         # if cat_at_door_reminder and appearing on screen with some delay, then it acts as reminder aknowledgement
         if cat_at_door_reminder and utime.time() > cat_at_door_time + radar_min_signal_time_s:
             cat_at_door_reminder = False       # reset the cat_at_door_reminder 
             buzzer_done = 0                    # reset the buzzer counter
             print("Aknowledged the cat_at_door reminder")  # feedback is printed to the terminal
-#             show_ack_epd(epd, wifi_connected, battery_level,
-#                          date_time, last_stat_mcu_temp, lora_iterations) # plot info to the epd display
 
     
     # checking if it is time connect with the stationary device
@@ -1433,6 +1575,7 @@ while True:
         toa_us = lora_sx.getTimeOnAir(len(query))
 
         # looping while waiting to the LoRa response (max 3 secs)
+        # lora_callback updates the cats_status Global variable 
         t_ref = utime.ticks_ms()
         while utime.ticks_ms() - t_ref < 3000:
             if lora_connect_counter > prev_lora_connect_counter:
@@ -1460,6 +1603,7 @@ while True:
         
         # reset cat_at_door_flag (i.e. when the stationary dev is booted)
         if cats_status[0] == 'd':                   # 'd' means disabled
+            print("cats_status set to False on request of the Portable device (i.e. due to booting")
             cat_at_door_flag = False                # flag to track the presence of cats at the door is set False
             cats_status = cats_status[1:]           # initial 'd' is removed from the cats_status string
         
@@ -1469,9 +1613,9 @@ while True:
         # case no mcu_temp update from the stationary device
         if stat_mcu_temp != "":
             last_stat_mcu_temp = stat_mcu_temp
-
-        # reset variable right after cat presence aknoledgement
-        if utime.time() - cat_at_door_time <  radar_min_signal_time_s:  # case the cats detection has been aknowledged
+        
+        # reset variable right after cat presence aknowledgement
+        if button_pressed and utime.time() - cat_at_door_time <  radar_min_signal_time_s:  # case the cats detection has been aknowledged
             cat_at_door_flag = False                       # reset the cat_at_door_flag status
             cats_at_the_door = []                          # reset tle list of the cats names
             cats_status = no_cats_text                     # reset the cats_status
@@ -1500,9 +1644,9 @@ while True:
             print("buzzer_done:", buzzer_done, "   buzzer_repeats:", buzzer_repeats)
         
         # update the epd display
-        show_info_epd(epd, wifi_connected, battery_level, date_time, last_stat_mcu_temp,
-                      radar_detection, cats_at_the_door, cat_at_door_reminder,
-                      cat_at_door_time, cats_lbe_rssi, lora_iterations)
+        show_info_epd(epd, lora_connect_status, wifi_connected, battery_level, date_time,
+                      last_stat_mcu_temp, radar_detection, cats_at_the_door, cat_at_door_reminder,
+                      cat_at_door_time, cats_lbe_rssi, battery_voltage)
         
         # check and eventually adjust the loRa trasnmission power
         lora_tx_power, missed_lora_packets, lora_sender_pwr_action = adjust_lora_tx_power(lora_rssi_sender,
@@ -1515,15 +1659,42 @@ while True:
         # measure the cycle time (in ms)
         cycle_time = utime.ticks_ms() - now_ms
         
+        # calculate the sleeping time, to maintain the lora_conn_interval_ms cadence
+        sleep_ms = lora_conn_interval_ms - cycle_time
+        
+        # clean the Writer state
+        Writer.state.clear()
+        
+        # force a memory cleaning cycle
+        clean_mem()
+        
+        # clamp the sleeping time
+        if sleep_ms < 200:
+            sleep_ms = 200
+        elif sleep_ms > lora_conn_interval_ms:
+            sleep_ms = lora_conn_interval_ms
+        
+        
         # MCU lightsleep while waiting for the next loRa connections (reduce battery consumption)
         if not cat_at_door_flag:
-            lightsleep(lora_conn_interval_ms - cycle_time)
+            if WDT_ENABLED:
+                wdt.feed()
+            
+            for p in (epd.cs_pin, epd.dc_pin, epd.reset_pin):
+                p.init(Pin.OUT, hold=True)
+            
+            if verbose:
+                print(f"Going to lightspeep for {sleep_ms} ms")
+                print()
+            
+            lightsleep(sleep_ms)
+            
+            for p in (epd.cs_pin, epd.dc_pin, epd.reset_pin):
+                p.init(Pin.OUT, hold=False)
         
         # checks if devise is active longer than timeout; If so go to deepsleep
         if lora_iterations >= max_lora_iterations:   # case the lora iterations equals/exceed the max
             goto_deepsleep()                         # calls the goto_deepsleep function
-        
-
         
     else:                 # case it is not time to communicate with the stationary device
         utime.sleep(0.05) # sleep for some little time
