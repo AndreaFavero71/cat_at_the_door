@@ -1,8 +1,9 @@
 """
-Andrea Favero, 20250608   (rev 0.3 20260926)
+Andrea Favero, 20250608 (rev 0.4 20261012)
 
 'Door at the door' project
 Code for the portable device
+
 
 Hardware:
 - Heltec WiFi LoRa 32 V3 board (based on ESP32-S3)
@@ -31,7 +32,7 @@ Energy:
 
 
 EPD Display:
-- LoRa icon, if la coomunication was established, and signal strenght.
+- LoRa icon, if latest coomunication was established, and signal strenght.
 - WiFi icon, if latest WiFI connection was established.
 - Battery icon, with charge level periodically checked on the battery voltage.
 - Bel icon if enabled, and related number of buzzer repeats
@@ -46,19 +47,33 @@ Config:
 - Cats'names and related ble mac addresses in ble_tags.json
 
 
+##################### Revisions ##########################
 
-20250923 rev 0.4:
+20261012 rev 0.5:
+1) Changed MicroPython version to 'MicroPython v1.24.1-dirty on 2024-12-03'
+   that seems more stable wrt psram management.
+2) Reverted back to EPD full refresh at every cycle, as the overall
+power consumption is lower.
+3) Changed Writer usage, by setting wri_22 and wri_26 as global, and
+   passing .device and .devid. This better manages memory.
+4) Added SHIFT parameter for battery voltage ADC channel calibration.
+5) Added low-pass filter on battery voltage averaging.
+6) WiFi active for just the time needed to NTP sync, while setting LoRa OFF.
+7) When NTP sync, a heartbeat log is added to logfile.
+
+
+20260926 rev 0.4:
 1) Corrected slicing bug when parsing “<” or “>” from the LoRa payload.
 2) Corrected bug: show_ack_epd now receives show_time (previously received
    lora_iterations, causing the ack display to sleep for the full iteration
    count and trip the WDT once past ~60 cycles).
-3) Corrected bug: show_ack_epd now calls clear_epd with arguments.
+3) Removed clear_epd and related call to it.
 4) Removed duplicated reset variables after acknowledgment.
 5) Changed to EPD partial update, with periodic EPD full refresh
    (epd_full_refresh_every_n in config.json).
-6) Hold the EPD control pins (CS/DC/RST) across MCU lightsleep, and release
-   them on wake, so EPD partial refresh survives the power-down.
-6) Added explicit periodic gc.collect() calls to prevent heap exhaustion.
+6) Hold the EPD RST pin across MCU lightsleep, and release it
+   on wake, so EPD partial refresh survives the power-down.
+7) Added explicit periodic gc.collect() calls to prevent heap exhaustion.
 
 
 20250615 rev 0.3:
@@ -68,22 +83,7 @@ Config:
 
 
 Rev 0.2: removed bug on battery_voltage_list growing indefinetely, revised battery_level
-
 """
-
-
-
-
-###########################################################################################
-# prints to the Shell to show the code is running #########################################
-###########################################################################################
-
-print(f"\n{'#' * 60}")
-print(f"{'#' * 12}    Portable device started ...    {'#' * 13}")
-print(f"{'#' * 60}\n")
-
-
-
 
 
 
@@ -94,8 +94,56 @@ print(f"{'#' * 60}\n")
 # enabling prints to the Shell
 verbose = False
 
+# setting for the oled display usage
+oled_disp_enabled = False         # this variable gets updated from the config.json setting
+
+# setting for the wifi usage
+wifi_enabled = False              # this variable gets updated from the config.json setting
+
 # setting for the Watch Dog Timer
 WDT_ENABLED = True
+
+
+
+###########################################################################################
+# prints to the Shell to show the code is running #########################################
+###########################################################################################
+
+if verbose:
+    print(f"\n{'#' * 60}")
+    print(f"{'#' * 12}    Portable device started ...    {'#' * 13}")
+    print(f"{'#' * 60}\n")
+
+
+
+###########################################################################################
+# Functions ###############################################################################
+###########################################################################################
+
+import gc
+
+def check_mem(text=""):
+    """Function to check the memory."""
+    if verbose:
+        print(f"{text} Allocated mem: {gc.mem_alloc()};  Free mem: {gc.mem_free()}")
+
+def clean_mem():
+    """Function to clean the memory."""
+    
+    if not verbose:
+        gc.collect()
+        return
+    
+    mem_alloc_1 = gc.mem_alloc()
+    mem_free_1 = gc.mem_free()
+    gc.collect()
+    mem_alloc_2 = gc.mem_alloc()
+    if verbose:
+        print(f"Allocated mem: before {mem_alloc_1} and after gc.collect {mem_alloc_2}, recovered {mem_alloc_1-mem_alloc_2}")
+        print(f"Free mem: before {mem_free_1} and after gc.collect {gc.mem_free()}")
+
+
+check_mem("Memory at start up:")
 
 
 
@@ -109,30 +157,13 @@ with open("lib/welcome_icon.bin", "rb") as f:       # opens the binary file with
     welcome_icon = bytearray(f.read())              # makes a bytearray from the image
 
 epd = EPD(width=128, height=296, orientation=90)    # valid orientations are 0, 90 and 180
+epd.init_Fast()           # wake the epd up from sleep
+epd.buffer = welcome_icon # fills the framebuffer with the welcome_icon
+epd.get_buffer()          # rotates buffer and send it to EPD (portrait write to EPD, taking ca 60ms)
+epd.display()             # plots the buffer to the display (takes ca 1.8 secs)
+epd.sleep()               # prevents display damages on the long run (command takes ca 100ms)
 
-epd.init_Fast()             # wake the epd up from sleep
-epd.buffer = welcome_icon   # fills the framebuffer with the welcome_icon
-epd.display(epd.get_buffer())  # plots the buffer to the display (takes ca 1.8 secs)
-epd.sleep()                 # prevents display damages on the long run (command takes ca 100ms)
-
-welcome_icon = None         # release welcome_icon to free up some memory 
-
-
-
-###########################################################################################
-# Memory check and clean ##################################################################
-###########################################################################################
-import gc
-
-def clean_mem():
-    """Function to clean the memory."""
-    
-    mem_alloc_1 = gc.mem_alloc()
-    mem_free_1 = gc.mem_free()
-    gc.collect()
-    mem_alloc_2 = gc.mem_alloc()
-    print(f"Allocated mem: before ({mem_alloc_1}) and after gc.collect ({mem_alloc_2}), recovered {mem_alloc_1-mem_alloc_2}")
-    print(f"Free mem: before ({mem_free_1}) and after gc.collect ({gc.mem_free()})\n")
+welcome_icon = None       # release welcome_icon to free up some memory 
 
 # force a memory cleaning cycle
 clean_mem()
@@ -143,21 +174,21 @@ clean_mem()
 # Libraries import ########################################################################
 ###########################################################################################
 
-from machine import Pin, ADC, PWM, RTC, Timer, deepsleep, lightsleep, WDT, SoftI2C
+from machine import Pin, ADC, PWM, RTC, Timer, WDT, SoftI2C, deepsleep, lightsleep
 from machine import reset_cause, PWRON_RESET, HARD_RESET, WDT_RESET, DEEPSLEEP_RESET, SOFT_RESET
 
 import sys, network, ntptime, json, ubluetooth, ssd1306, utime, struct
 
 from datetime_converter import DateTimeConverter    # date time conversion w/wo internet
-from rotary_irq_esp import RotaryIRQ   # import for the encoder knob
-from esp32 import mcu_temperature      # import for mcu temperature check
-from sx1262 import SX1262              # import for LoRa communication
+from rotary_irq_esp import RotaryIRQ                # import for the encoder knob
+from esp32 import mcu_temperature                   # import for mcu temperature check
+from sx1262 import SX1262                           # import for LoRa communication
 
 # import for edp display
-from icons import Icons                # import custom icons
-from writer import Writer              # library for text
-import helvetica22bold                 # import for edp display
-import helvetica26bold                 # import for edp display
+from icons import Icons                             # import custom icons
+from writer import Writer                           # library for text
+import helvetica22bold                              # import for edp display
+import helvetica26bold                              # import for edp display
 
 # force a memory cleaning cycle
 clean_mem()
@@ -172,20 +203,19 @@ clean_mem()
 PUSH_BUTTON = Pin(4, Pin.IN, Pin.PULL_UP)  # pin for the push button of the encode
 
 
+# push button debounce constants
+BUTTON_DEBOUNCE_MS = 50                  # only considers signal longher than 50 ms
+BUTTON_BLOCK_MS    = 200                 # ignore further signals within 200 ms from previous
+
+
 # hardware setup for buzzer
-BUZZER = PWM(Pin(5), freq=1000, duty_u16=65535)  # Start OFF (transistor inverts logic)
-buzzer_timer = Timer(2)                  # Virtual timer if -1
-
-
-# Set a NTP server, for date time synchronization (should preferibly consider area of living)
-ntptime.host = "europe.pool.ntp.org"
-ntptime.timeout = 10                     # timeout in seconds
+BUZZER = PWM(Pin(5), freq=1000, duty_u16=65535)  # start OFF (transistor inverts logic)
 
 
 # settings for different time related controls
-NTP_UPDATE_INTERVAL_S = 1800             # period (in secs) in between the RTC alignmento to NTP
 BATTERY_CHECK_INTERVAL_S = 300           # period (in secs) in between battery level check
-
+NTP_UPDATE_INTERVAL_S = 1200             # period (in secs) in between the RTC alignmento to NTP
+                                         # and to save a heatbeat (1200 = 20 minutes)
 
 # settings file
 FILE_NAME_CONFIG = "config.json"         # file storing most of the settings
@@ -193,20 +223,21 @@ FILE_NAME_CONFIG = "config.json"         # file storing most of the settings
 
 # settings for BLE tags scanner
 FILE_NAME_TAGS = "ble_tags.json"         # file to store the BLE tags mappings
-BLE_SCAN_TIME = 10                       # seconds to scan for BLE devices
-BLE_RSSI_THRESHOLD = -80                 # ignore devices with RSSI below this value
 
 
 # settings for battery voltage check
 ADC_CTRL = Pin(37, Pin.OUT)              # GPIO37 enables battery voltage measurement
 ADC_IN = Pin(1)                          # GPIO1 reads battery voltage
-adc_bat = ADC(ADC_IN)                    # adc object
-adc_bat.atten(ADC.ATTN_11DB)             # 11dB attenuation (input range up to ~3.3V)
 V_REF = 3.3                              # ADC reference voltage (assuming ESP32 powered at 3.3V)
 DIVIDER_RATIO = 4.9                      # voltage divider ratio: (R14 + R13) / R14 = (100 + 390) / 100
 VBAT_READINGS = 20                       # number of readings for averaging
-CORRECTION = 1.048                       # correction of adc reading vs measured (multimeter)
+VOLTAGE_LEVELS = (4.02, 3.95, 3.84, 3.725, 3.675, 3.64, 3.59) # voltage thresholds tupple
+PERCENT_LEVELS = (100, 80, 60, 40, 20, 10, 0)                 # battery levels tupple
 
+
+# constants for the ADC calibration
+CORRECTION = 1.0687       #(default 1.0) # correction of adc reading slope vs measured (multimeter)
+SHIFT = 0.085             #(default 0.0) # correction of adc reading shift vs measured (multimeter)  
 
 # settings for dynamic adustment of the LoRa transmission power
 MIN_LORA_RSSI_TARGET = -100              # min LoRa rssi signal level, to provide feedback to sender
@@ -216,21 +247,27 @@ LORA_TX_POWER_MAX = 22                   # max possible for SX1262
 MIN_MISSED_PACKETS = 4  # lower number of LoRa missed connections to bring the LoRa power to MAX
 MAX_MISSED_PACKETS = 15 # upper number of LoRa missed connections to give up (bring the LoRa power to NOM)   
 
+
+
 ###########################################################################################
-# settings ################################################################################
+# Settings ################################################################################
 ###########################################################################################
 
-# setting for the oled display usage
-oled_disp_enabled = False           # this variable gets updated from the config.json setting
+# bugzzer timer
+buzzer_timer = Timer(2)             # virtual timer if -1
 
 
-# setting for the wifi usage
-wifi_enabled = False                # this variable gets updated from the config.json setting
+# NTP server setting, for date time synchronization (should preferibly consider area of living)
+ntptime.host = "europe.pool.ntp.org"
+ntptime.timeout = 10                # timeout in seconds
+
+
+# adc input pin setting
+adc_bat = ADC(ADC_IN)               # adc object
+adc_bat.atten(ADC.ATTN_11DB)        # 11dB attenuation (input range up to ~3.3V)
 
 
 # push button settings
-BUTTON_DEBOUNCE_MS = 50             # was debounce_timer, 50 ms
-BUTTON_BLOCK_MS    = 200            # was push_button_block_timer, 200 ms
 button_edge_ms     = 0              # ticks_ms of the last falling edge (set by IRQ)
 button_last_ms     = 0              # ticks_ms of the last accepted press (set by main loop)
 button_pressed     = False          # flag consumed by the main loop
@@ -245,10 +282,11 @@ lora_rssi = None                    # lora_rssi is initially set to None
 missed_lora_packets = 0             # counter of consecutive missed LoRa packages
 lora_tx_power = 0                   # LoRa power, later get update by the config.json
 initial_lora_tx_power = 0           # initial LoRa power, later get update by the config.json
-lora_rssi_sender = None             # lora_lora_rssi_sender is initially set to None
+lora_rssi_sender = None             # lora_rssi_sender is initially set to None
 lora_sender_pwr_action = ""         # (one char) string for LoRa tx power adjustment at sender
 query = ""                          # query string send buy the portable device 
-toa_us = 0                          # Time-on-Air is microseconds
+toa_us = 0                          # Time-on-Air in microseconds
+
 
 # variables related to the radar detection status (info via LoRa communication)
 radar_detection = False             # gets updated based on responder device info
@@ -267,23 +305,22 @@ buzzer_done = 0                     # counter of the times the buzzer has been a
 battery_voltage_list = []           # initialize list holdist the last voltage measurements
 battery_voltage = 0                 # initialize variable holding the battery voltage
 battery_level = 0                   # initialize variable holding the battery level
-last_battery_check_time = 0         # initialize variable holding the last battery check time
+
+# last battery check time reference is set negative to force a first check at the start
+last_battery_check_time = -BATTERY_CHECK_INTERVAL_S   
 
 
 # system related initial variables
 wifi_connected = False              # flag to track the wifi connection status
 oled_display_menu = False           # flag to track when dealing with the menu on screen
 
-# EPD refresh bookkeeping
-partial_refresh_count = 0           # partial refreshes since the last full refresh
-epd_full_refresh_every_n = 60       # full refresh when count reaches this (updated from config.json)
 
 # mcu temperature of portable device is used as initial mcu temp of the stationary device
 last_stat_mcu_temp = mcu_temperature()
 
 
 ###########################################################################################
-# functions ###############################################################################
+# Functions ###############################################################################
 ###########################################################################################
 
 def load_config(fname):
@@ -339,15 +376,42 @@ def decode_my_ble_tags(my_ble_tags):
 def init_oled_backlight(config):
     """Initialize the backlight control pin for oled display"""
     
-    oled_backlight_pin = Pin(config['oled_display']['oled_backlight_pin'], Pin.OUT, value=1)  # Start with backlight off
+    oled_backlight_pin = Pin(config['oled_display']['oled_backlight_pin'], Pin.OUT, value=1)  # start with backlight off
     return oled_backlight_pin
 
 
 
 def get_reset_reason():
-    """Checks the reason for the MCU boot, in essence what happened at the power off (WDT, DeepSleep, etc)."""
+    """
+    Return the reset cause of the current boot as a numeric code, plus a
+    human-readable message.
+
+    The numeric code is one of the constants exposed by MicroPython's
+    `machine` module on ESP32-S3. The mapping is stable across the
+    MicroPython versions used on this project, but the meaning and the
+    actual numeric values may differ on other ports or on future
+    releases. The function falls back to a generic '???' message for any
+    value not covered below.
+
+    Common values on ESP32-S3:
+        0   PWRON_RESET       Clean power-on (the board was just powered)
+        1   HARD_RESET        Reset from an external pin, typically the
+                              EN/reset button, or a supply glitch that
+                              the brownout detector did not catch
+        2   WDT_RESET         Software watchdog (machine.WDT) timed out
+        3   DEEPSLEEP_RESET   Wake-up from deepsleep
+        4   SOFT_RESET        Software reset, e.g. machine.reset() or
+                              an IDE-triggered "Run" (REPL restart)
+        others                Fall through as '???: <number>'
+
+    The reset cause is intentionally *not* cleared on read: it persists
+    for the lifetime of the boot. It is also independent of the RTC
+    memory contents. When the value is recorded in heartbeat.log, it
+    reflects the reason for the *current* boot, and thus identifies the
+    reason for any reboots that preceded the current running session.
+    """
     
-    reset_reason = reset_cause()          # Get reset cause
+    reset_reason = reset_cause()          # get reset cause
     reset_message = {
         PWRON_RESET:     "POWER-ON RESET",
         HARD_RESET:      "HARD RESET",
@@ -361,27 +425,37 @@ def get_reset_reason():
 
 
 
-def load_counter():
+def load_rtc_state():
     """
-    Load a counter from the RTC memory.
-    This is used to properly count the timeout also in case of unwanted reboots, like WDT.
+    Load the RTC-resident state:
+      - lora_iterations: counter of LoRa connections (also unsuccessful)
+      - prev_reset_reason: reset reason of the previous boot
+      - reboot_count: number of reboots since the last POWER-ON RESET
+    Returns (None, None, None) if the RTC memory is invalid or empty.
     """
-    
-    data = rtc.memory()          # reads the RTC memory
-    if len(data) != 2:           # check is two bytes
-        return None              # Memory invalid
-    try:                         # tenattive approach
-        val = struct.unpack(">H", data)[0]  # rom bytes to integer
-        return val               # counter is returned
-    except Exception:            # case of exceptions
-        return None              # corrupt format
+    data = rtc.memory()
+    if len(data) != 5:
+        return None, None, None
+    try:
+        iterations = struct.unpack(">H", data[0:2])[0]
+        prev_reason = data[2]
+        reboots = struct.unpack(">H", data[3:5])[0]
+        return iterations, prev_reason, reboots
+    except Exception:
+        return None, None, None
 
 
 
-def save_rtc_counter(val):
-    """Save the counter to the RTC memory"""
-    
-    rtc.memory(struct.pack(">H", val))
+def save_rtc_state(iterations, prev_reason, reboots):
+    """
+    Save the RTC-resident state as a packed 5-byte blob:
+      bytes 0-1: lora_iterations
+      byte  2  : previous reset reason
+      bytes 3-4: reboot count
+    """
+    rtc.memory(struct.pack(">H", iterations)
+               + bytes([prev_reason & 0xFF])
+               + struct.pack(">H", reboots))
 
 
 
@@ -392,7 +466,8 @@ def get_wlan(config):
     It return the wlan object and a flag about connection result (succcess or failure).
     """
     
-    print("Activating WLAN function ...")
+    if verbose:
+        print("Activating WLAN function ...")
     wlan_connected = False
     print_once = True
     max_time_ms = 20000
@@ -411,48 +486,85 @@ def get_wlan(config):
 
             while not wlan.isconnected():
                 if utime.ticks_ms() - t_ref > max_time_ms:
-                    print(f"Timeout of {int(max_time_ms/1000)} secs on getting WiFi connection")
+                    if verbose:
+                        print(f"Timeout of {int(max_time_ms/1000)} secs on getting WiFi connection")
                     break
         
         elif wlan.isconnected():
             wlan_connected = True
-            print("Wlan is active")
-            print(f"Network config: {wlan.ifconfig()}\n")
+            if verbose:
+                print("Wlan is active")
+                print(f"Network config: {wlan.ifconfig()}")
             return wlan, wlan_connected
     
     if not wlan_connected:
-        print("Network connection filed")
+        if verbose:
+            print("Network connection filed")
         return None, False
 
 
 
 def is_wifi_connected():
     "Check if WLAN is connected"
-    
     wlan = network.WLAN(network.STA_IF)
     return wlan.isconnected()
+
+
+
+def disconnect_wifi():
+    "Disconnect WLAN"
+    times = 0
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(False)
+    
+    while wlan.active(): # case the wlan is stil active (time to switch off)
+        sleep_ms(5)      # sleep a small amount of time
+        times += 1       # increase the counter
+        if times >= 200: # interrup the while loop in case of 200 (or more) iterations
+            break
+    
+    if verbose:
+        print("Wlan deactivated")
 
 
 
 def sync_time(utc_shift, dst_shift):
     "Synchronize date and time via WLAN and NTP"
     
-    print("Updating RTC from NTP ...")
+    if verbose:
+        print("Updating RTC from NTP ...")
     try:
-        ntptime.settime()                   # Get UTC time
-        local_time = utime.localtime()      # Convert to structured time
-        yearday = local_time[7]             # Get day of the year
+        ntptime.settime()                        # get UTC time
+        local_time = utime.localtime()           # convert to structured time
+        yearday = local_time[7]                  # get day of the year
 
-        # Determine the correct time shift
-        if 85 <= yearday < 300:             # Roughly summer (DST)
+        # determine the correct time shift
+        if 85 <= yearday < 300:                  # roughly summer (DST)
             hour_offset = utc_shift + dst_shift  # hour shifter considers utc and dst
-        else:                               # Roughly winter (standard time)
-            hour_offset = utc_shift         # hour shifter considers utc
+        else:                                    # Roughly winter (standard time)
+            hour_offset = utc_shift              # hour shifter considers utc
 
-        # Apply time correction
+        # apply time correction
         local_time = list(utime.localtime(utime.mktime(utime.localtime()) + hour_offset * 3600))
-        print("RTC updated via NTP")
-        return True, local_time[:6]         # Return (year, month, day, hours, minutes, seconds)
+        if verbose:
+            print("RTC updated via NTP")
+        
+        # heartbeat log entry (persists across reboots)
+        year, month, day, hours, minutes, seconds = local_time[:6]
+        
+        log_heartbeat_txt = (
+                             f"{year:04d}-{month:02d}-{day:02d} "
+                            f"{hours:02d}:{minutes:02d}:{seconds:02d} "
+                            f"reset={reset_reason} iter={lora_iterations} reboots={reboot_count}"
+                            )
+        
+        log_heartbeat("heartbeat.log", log_heartbeat_txt)
+        
+        if verbose:
+            print("Saved heartbeat log:")
+            print(log_heartbeat_txt)
+            
+        return True, local_time[:6]              # return (year, month, day, hours, minutes, seconds)
 
     except Exception as e:
         print(f"Error on updating RTC from NTP: {e}")
@@ -466,10 +578,11 @@ def get_date_time(converter, ntp_reached, date_time, utc_shift, dst_shift):
     Right after an NTP connection, it separates the date and time fields from a list.
     """
     
-    if ntp_reached:                        # Case the NTP was reachable
+    if ntp_reached:                        # case the NTP was reachable
         year, month, day, hours, minutes, seconds = date_time
-        print(f"{day:02d}/{month:02d}/{str(year)[2:]}  {hours:02d}:{minutes:02d}\n")
-    else:                                  # Case the NTP was not reachable
+        if verbose:
+            print(f"NTP: {day:02d}/{month:02d}/{str(year)[2:]}  {hours:02d}:{minutes:02d}\n")
+    else:                                  # case the NTP was not reachable
         now = utime.time()                 # Epoch time from RTC of the board
         # time is split via the converter.unix_to_datetime (no libraries, ca 2ms)
         year, month, day, hours, minutes, seconds = converter.unix_to_datetime(now, utc_shift, dst_shift)
@@ -477,36 +590,39 @@ def get_date_time(converter, ntp_reached, date_time, utc_shift, dst_shift):
 
 
 
-def update_time(now, last_ntp_time_update, NTP_UPDATE_INTERVAL_S, first_time = False):
+def update_time(ntp_sync=True):
     "Updates the time, and handles exceptions"
     
-    ntp_reached = False
+    if not ntp_sync:
+        year, month, day, hours, minutes, seconds = get_date_time(converter, False, '', utc_shift, dst_shift)
+        return f"{day:02d}/{month:02d}/{str(year)[2:]}  {hours:02d}:{minutes:02d}:{seconds:02d}"
+        
     
-    if wifi_enabled and is_wifi_connected() and (first_time or now > last_ntp_time_update + NTP_UPDATE_INTERVAL_S):
-        ntp_reached, date_time = sync_time(utc_shift, dst_shift)  # Get the time from NTP (corrected by uts nad dst shifts)
+    ntp_reached = False
+
+    ntp_reached, date_time = sync_time(utc_shift, dst_shift)  # Get the time from NTP (corrected by uts nad dst shifts)
     
     if ntp_reached:
         year, month, day, hours, minutes, seconds = get_date_time(converter, True, date_time, utc_shift, dst_shift)
-        now = utime.time()            # Epoch time is assigned to now
-        last_ntp_time_update = now    # now is assigned to last_ntp_time_update  
     else:
         year, month, day, hours, minutes, seconds = get_date_time(converter, False, '', utc_shift, dst_shift)
     
-    date_time = f"{day:02d}/{month:02d}/{str(year)[2:]}  {hours:02d}:{minutes:02d}:{seconds:02d}"
-    return last_ntp_time_update, date_time
+    return f"{day:02d}/{month:02d}/{str(year)[2:]}  {hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
 
 def init_lora(config):
     "Setup the Lora communication."
 
-    print("Activating LoRa ...")
+    if verbose:
+        print("Activating LoRa ...")
+    
+    lora_tx_power = int(config['lora']['tx_power'])  # TX power in dBm
+    initial_lora_tx_power = lora_tx_power
+    if verbose:
+        print(f"Initial LoRa transmission power: {lora_tx_power} dB")
     
     try:
-        lora_tx_power = int(config['lora']['tx_power'])  # TX power in dBm
-        initial_lora_tx_power = lora_tx_power
-        print(f"Initial LoRa transmission power: {lora_tx_power} dB")
-        
         lora_sx = SX1262(spi_bus = int(config['lora']['spi_bus']),
                      clk =     Pin(int(config['lora']['clk_pin'])),
                      mosi =    Pin(int(config['lora']['mosi_pin'])),
@@ -518,31 +634,56 @@ def init_lora(config):
                      )
 
         # configure LoRa parameters
-        lora_sx.begin(freq =   int(config['lora']['frequency_MHz']),  # Frequency in MHz
-                      bw =     float(config['lora']['bw_KHz']),       # Bandwidth in kHz
-                      sf =     int(config['lora']['spread_factor']),  # Spreading factor
+        lora_sx.begin(freq =   int(config['lora']['frequency_MHz']),  # frequency in MHz
+                      bw =     float(config['lora']['bw_KHz']),       # bandwidth in kHz
+                      sf =     int(config['lora']['spread_factor']),  # spreading factor
                       power =  lora_tx_power,                         # TX power in dBm
-                      cr=7,                  # Coding rate (8 is stronger forward error correction)
-                      syncWord=0x12,         # Sync word
-                      currentLimit=60.0,     # Current limit in mA
-                      preambleLength=6,      # Preamble length  (6 is min, 8 is rather common)
-                      implicit=False,        # Implicit header mode
-                      implicitLen=0xFF,      # Implicit header length
+                      cr=7,                  # coding rate (8 is stronger forward error correction)
+                      syncWord=0x12,         # sync word
+                      currentLimit=60.0,     # current limit in mA
+                      preambleLength=6,      # preamble length  (6 is min, 8 is rather common)
+                      implicit=False,        # implicit header mode
+                      implicitLen=0xFF,      # implicit header length
                       crcOn=True,            # CRC enabled
                       txIq=False,            # TX IQ inversion
                       rxIq=False,            # RX IQ inversion
                       tcxoVoltage=1.7,       # TCXO voltage
-                      useRegulatorLDO=False, # Use LDO regulator
-                      blocking=True          # Blocking mode
+                      useRegulatorLDO=False, # use LDO regulator
+                      blocking=True          # blocking mode
                       )
 
         lora_sx.setBlockingCallback(False, lora_callback)
-        print("LoRa is active\n")
+        if verbose:
+            print("LoRa is active\n")
         return lora_sx, lora_tx_power, initial_lora_tx_power
     
     except Exception as e:
         print(f"Error while activating LoRa{e}")
         sys.exit(1)
+
+
+
+def lora_sleep():
+    """Put the LoRa chip in sleep mode (config retained) to free the air and save power."""
+    try:
+        lora_sx.sleep(retainConfig=True)
+        if verbose:
+            print("LoRa chip set to sleep")
+    except Exception as e:
+        print(f"Error while setting LoRa to sleep: {e}")
+
+
+
+def lora_standby():
+    """Wake the LoRa chip from sleep, keeping its configuration."""
+    try:
+        state = lora_sx.standby()
+        if verbose:
+            print("LoRa chip back to standby")
+        return state
+    except Exception as e:
+        print(f"Error while waking LoRa: {e}")
+        return None
 
 
 
@@ -555,7 +696,8 @@ def validate_lora_interval_s(duty_cycle_percent, lora_interval_s, cat_num):
     Calculation based on the portable device.
     """
     
-    print("Validating the lora_interval_s settings against the duty_cycle_percent and LoRa settings ...")
+    if verbose:
+        print("Validating the lora_interval_s settings against the duty_cycle_percent and LoRa settings ...")
         
     # message from the portable device ("ck" or "ck>" makes no difference)
     msg1 = "ck>"               # this string is independant from number of cats
@@ -579,11 +721,11 @@ def validate_lora_interval_s(duty_cycle_percent, lora_interval_s, cat_num):
     toa_stationary_sum_us = 0
     for i, msg in enumerate(messages):
         if i == 0:                                       # portable device 
-            toa_msg1_us = lora_sx.getTimeOnAir(len(msg)) # toa is calculated via the lora library
+            toa_msg1_us = lora_sx.getTimeOnAir(len(msg)) # ToA is calculated via the lora library
         else:                                            # stationary devices
             w = weight[i]                                # weighting factor
             toa_us = lora_sx.getTimeOnAir(len(msg))      # ToA is calculated via the lora library
-            toa_stationary_sum_us += + toa_us * w                   # weighted ToA 
+            toa_stationary_sum_us += + toa_us * w        # weighted ToA 
     
     avg_toa_ms = toa_stationary_sum_us/1000
     toa_ms_allowed_hourly = int(3600*1000*duty_cycle_percent/100)
@@ -599,18 +741,20 @@ def validate_lora_interval_s(duty_cycle_percent, lora_interval_s, cat_num):
         min_lora_interval_s = 1 + int(min_lora_interval_s)
 
     if min_lora_interval_s <= lora_interval_s:
-        print(f"Setting min_lora_interval_s = {lora_interval_s}, in config.json file,"
-              f"warrants the {duty_cycle_percent}% duty cycle")
-        print(f"Minimum time interval allowed at 'lora_interval_s': {min_lora_interval_s} s")
+        if verbose:
+            print(f"Setting min_lora_interval_s = {lora_interval_s}, in config.json file,"
+                  f"warrants the {duty_cycle_percent}% duty cycle")
+            print(f"Minimum time interval allowed at 'lora_interval_s': {min_lora_interval_s} s")
         return lora_interval_s
     else:
-        print(f"\nAverage ToA per LoRa transmission: {int(round(avg_toa_ms,0))} ms")
-        print(f"Max ToA allowed per hour due to max duty-cycle: {toa_ms_allowed_hourly} ms")
-        print(f"Max number of LoRa connection per hour: {int(round(max_lora_connections_per_hour,0))}")
-        print(f"Minimum time interval allowed at 'lora_interval_s': {min_lora_interval_s} s")
-        print(f"\nSetting min_lora_interval_s = {lora_interval_s}, in config.json file, must be increase to"
-              f"at least {min_lora_interval_s} to warrent the {duty_cycle_percent}% duty cycle")
-        print(f"CAT AT THE DOOR system proceeds by using min_lora_interval_s = {min_lora_interval_s}")
+        if verbose:
+            print(f"\nAverage ToA per LoRa transmission: {int(round(avg_toa_ms,0))} ms")
+            print(f"Max ToA allowed per hour due to max duty-cycle: {toa_ms_allowed_hourly} ms")
+            print(f"Max number of LoRa connection per hour: {int(round(max_lora_connections_per_hour,0))}")
+            print(f"Minimum time interval allowed at 'lora_interval_s': {min_lora_interval_s} s")
+            print(f"\nSetting min_lora_interval_s = {lora_interval_s}, in config.json file, must be increase to"
+                  f"at least {min_lora_interval_s} to warrent the {duty_cycle_percent}% duty cycle")
+            print(f"CAT AT THE DOOR system proceeds by using min_lora_interval_s = {min_lora_interval_s}")
         return min_lora_interval_s
 
 
@@ -657,25 +801,29 @@ def adjust_lora_tx_power(lora_rssi_sender, lora_tx_power, missed_lora_packets):
             if lora_tx_power < LORA_TX_POWER_MAX:
                 lora_tx_power = LORA_TX_POWER_MAX
                 lora_sx.setOutputPower(lora_tx_power)
-                print(f"\nIncreasing LoRa TX power to max MAX: {lora_tx_power} dBm")
+                if verbose:
+                    print(f"\nIncreasing LoRa TX power to max MAX: {lora_tx_power} dBm")
         
         elif missed_lora_packets > MAX_MISSED_PACKETS:
             lora_sx.setOutputPower(initial_lora_tx_power)
             lora_tx_power = initial_lora_tx_power
-            print(f"\nSet LoRa TX power to default value: {initial_lora_tx_power} dBm")
+            if verbose:
+                print(f"\nSet LoRa TX power to default value: {initial_lora_tx_power} dBm")
         
     if lora_rssi_sender is not None and lora_rssi is not None:
         # case of week LoRa rssiat sender, and receiver not yet to its MAX power
         if lora_rssi_sender == 0 and lora_tx_power < LORA_TX_POWER_MAX:
             lora_tx_power += 1
             lora_sx.setOutputPower(lora_tx_power)
-            print(f"\nIncreasing LoRa TX power to {lora_tx_power} dBm")
+            if verbose:
+                print(f"\nIncreasing LoRa TX power to {lora_tx_power} dBm")
         
         # case of strong LoRa rssi at sender, and receiver not yet to its MIN power
         elif lora_rssi_sender == 1 and lora_tx_power > LORA_TX_POWER_MIN:
             lora_tx_power -= 1
             lora_sx.setOutputPower(lora_tx_power)
-            print(f"\nDecreasing LoRa TX power to {lora_tx_power} dBm")
+            if verbose:
+                print(f"\nDecreasing LoRa TX power to {lora_tx_power} dBm")
 
     return lora_tx_power, missed_lora_packets, lora_sender_pwr_action
 
@@ -694,9 +842,11 @@ def lora_callback(events):
         if error == "ERR_NONE":
             cats_status = msg.decode("utf-8")
             lora_connect_counter += 1
-            print(f"\nquery: {query} ; ToA:{toa_us//1000}ms ; LoRa power:{lora_tx_power} ; LoRa RSSI:{lora_rssi} ; cats_status: {cats_status}")
+            if verbose:
+                print(f"\nCycle {lora_iterations}; query {query} ; ToA:{toa_us//1000}ms ; LoRa power:{lora_tx_power} ; LoRa RSSI:{lora_rssi} ; cats_status: {cats_status}")
         else:
-            print("LoRa conection error")
+            if verbose:
+                print("LoRa conection error")
 
     elif events & SX1262.TX_DONE:
 #         print("TX done\n")
@@ -704,22 +854,25 @@ def lora_callback(events):
 
 
 
-def read_battery_voltage(adc_avg=0, bat_voltage=0):
+def read_battery_voltage():
     """Monitor the battery voltage"""
-    t_ref = utime.ticks_ms()
+    adc_avg=0
+    bat_voltage=0
+    
     try:
-        ADC_CTRL.value(1)              # Enable battery voltage measurement
-        utime.sleep_ms(20)             # Stabilization delay
-        adc_avg = adc_bat.read()       # First ADC reading
-        utime.sleep_ms(5)              # Short sleep time
-
-        for _ in range(VBAT_READINGS): # Iterating VBAT_READINGS times
-            adc_avg += adc_bat.read()  # Adds raw ADC value (0-4095) for VBAT_READINGS times
-            utime.sleep_ms(10)         # Short sleep time
+        ADC_CTRL.value(1)              # enable battery voltage measurement
+        utime.sleep_ms(20)             # stabilization delay
+        adc_avg = adc_bat.read()       # first ADC reading
+        utime.sleep_ms(10)             # short sleep time
+        
+        for _ in range(VBAT_READINGS): # iterating VBAT_READINGS times
+            adc_avg += adc_bat.read()  # adds raw ADC value (0-4095) for VBAT_READINGS times
+            utime.sleep_ms(10)         # short sleep time
 
         adc_avg /= (VBAT_READINGS + 1) # average the VBAT_READINGS readings
-        bat_voltage = CORRECTION * (adc_avg / 4095) * V_REF * DIVIDER_RATIO # convertion to batt voltage and correction
-        ADC_CTRL.value(0)              # Disable measurement to save power
+        bat_voltage = SHIFT + CORRECTION * (adc_avg / 4095) * V_REF * DIVIDER_RATIO # convertion to batt voltage and correction
+        
+        ADC_CTRL.value(0)              # disable measurement to save power
         return bat_voltage             # returns the measured battery voltag
 
     except Exception as e:
@@ -736,35 +889,47 @@ def get_battery_percentage(voltage):
     Returns:
         int: The battery percentage that best matches the voltage.
     """
-    voltage_levels = [3.98, 3.88, 3.82, 3.74, 3.7, 3.65, 3.6]
-    percent_levels = [ 100,   80,   60,   40,  20,   10,   0]
 
-    # Find the index of the voltage level closest to the measured voltage
-    closest_index = min(range(len(voltage_levels)), key=lambda i: abs(voltage - voltage_levels[i]))
-    return percent_levels[closest_index]
+    # find the index of the voltage level closest to the measured voltage
+    closest_index = min(range(len(VOLTAGE_LEVELS)), key=lambda i: abs(voltage - VOLTAGE_LEVELS[i]))
+    return PERCENT_LEVELS[closest_index]
 
 
 
-def check_battery(now, battery_voltage, battery_voltage_list, battery_level,last_battery_check_time,
-                  BATTERY_CHECK_INTERVAL_S, force_battery_check = False):
-        
-    if force_battery_check or now > last_battery_check_time + BATTERY_CHECK_INTERVAL_S:
-        repeats = 5 if force_battery_check else 1
-        for i in range(repeats):
-            battery_voltage = round(read_battery_voltage(),2) # battery voltage is measured   
-            battery_voltage_list.append(battery_voltage)
-        
-        if len(battery_voltage_list) > 1:
-            battery_voltage = sum(battery_voltage_list) / len(battery_voltage_list)
-        elif len(battery_voltage_list) > 5:
-            battery_voltage_list = battery_voltage_list[-5:]
-            
-        battery_level = get_battery_percentage(battery_voltage)
-        
-        print(f"\nBattery voltage = {battery_voltage:.2f}V,  Battery level = {battery_level}%\n")
-        last_battery_check_time = utime.time()
+def check_battery(battery_voltage_list):
+
+    battery_voltage = round(read_battery_voltage(),4) # battery voltage is measured
     
-    return battery_voltage, battery_voltage_list, battery_level, last_battery_check_time
+    if len(battery_voltage_list) <= 1:
+        battery_voltage_list.append(battery_voltage)
+        battery_level = get_battery_percentage(battery_voltage)
+    
+    else:
+        avg_battery_voltage = sum(battery_voltage_list) / len(battery_voltage_list)
+        battery_voltage_list.append(round(0.7*avg_battery_voltage + 0.3*battery_voltage, 4)) # low-pass fiter
+        avg_battery_voltage = sum(battery_voltage_list) / len(battery_voltage_list)
+        battery_level = get_battery_percentage(avg_battery_voltage)
+        battery_voltage = round(avg_battery_voltage,4)
+    
+    if verbose:
+        print(f"\nBattery voltage = {battery_voltage:.4f}V,  Battery level = {battery_level}%\n")
+
+    datalen = len(battery_voltage_list)
+    if datalen > 5:
+        battery_voltage_list = battery_voltage_list[datalen -5 :]
+    
+    return battery_voltage, battery_voltage_list, battery_level
+
+
+
+def check_encoder(last_encoder_value, oled_display_menu):
+    encoder_value = rotary.value()
+    if encoder_value != last_encoder_value:
+        if verbose:
+            print("Rotary Encoder Value:", encoder_value)
+        last_encoder_value = encoder_value
+        oled_display_menu = True
+    return encoder_value, last_encoder_value, oled_display_menu
 
 
 
@@ -775,16 +940,18 @@ def btn_pressed(pin):
 
 
 
-# Initialize I2C for the OLED display
+# initialize I2C for the OLED display
 def get_i2c(config):
-    print("Activating I2C function ...")
+    if verbose:
+        print("Activating I2C function ...")
     from machine import SoftI2C
     try:
-        oled_sda_pin = Pin(config['oled_display']['oled_sda_pin'], Pin.OPEN_DRAIN, pull=Pin.PULL_UP) # Set I2C pins in open_drain mode
-        oled_scl_pin = Pin(config['oled_display']['oled_scl_pin'], Pin.OPEN_DRAIN, pull=Pin.PULL_UP) # Set I2C pins in open_drain mode
-        oled_rst_pin = Pin(config['oled_display']['oled_rst_pin'], Pin.OUT, value=1) # Initialize the OLED reset pin
+        oled_sda_pin = Pin(config['oled_display']['oled_sda_pin'], Pin.OPEN_DRAIN, pull=Pin.PULL_UP) # set I2C pins in open_drain mode
+        oled_scl_pin = Pin(config['oled_display']['oled_scl_pin'], Pin.OPEN_DRAIN, pull=Pin.PULL_UP) # set I2C pins in open_drain mode
+        oled_rst_pin = Pin(config['oled_display']['oled_rst_pin'], Pin.OUT, value=1) # initialize the OLED reset pin
         i2c = SoftI2C(sda=oled_sda_pin, scl=oled_scl_pin)
-        print("I2C is active\n")
+        if verbose:
+            print("I2C is active\n")
         return i2c
     except Exception as e:
         print(f"Error while activating I2C {e}")
@@ -792,7 +959,7 @@ def get_i2c(config):
 
 
 
-# Choose between I2C and BLE
+# choose between I2C and BLE
 def get_either_epd_ble_wlan(choice, config,  ubluetooth, network):
     return
 
@@ -811,7 +978,7 @@ def analyze_cats_status(cats_status):
     """
 
     if verbose:
-        print(f"Raw cats_status: {cats_status}")
+        txt_1 = cats_status
     
     at_the_door = []                            # empty list to store cats name when at the door
     lbe_rssi = []                               # empty list to store lbe rssi when at the door
@@ -830,10 +997,10 @@ def analyze_cats_status(cats_status):
     if detected[0] == 'r':                      # case detected starts with 'r'
         detected = detected[1:]                 # initial 'r' is removed to detected
         if verbose:
-            print("Radar detection: True")
+            txt_2 = "Radar detection: True"
     else:
         if verbose:
-            print("Radar detection: False")
+            txt_2 = "Radar detection: False"
     
     if detected[0] == 't':                      # case sliced detected starts with 't'
         comma_pos = detected.find(",")          # position of first comma in string
@@ -842,7 +1009,6 @@ def analyze_cats_status(cats_status):
         if verbose:
             print(f"Stationary device temperature: {stat_mcu_temp}")
     
-    cats_number = 0                             # assumption of no cats
     if detected.count(',') > 0:                 # at least 2 cats
         cats_number = detected.count(',') + 1   # number of cats
     else:                                       # one or zero cats
@@ -850,6 +1016,7 @@ def analyze_cats_status(cats_status):
             cats_number = 1                     # 1 cat
         else:                                   # less than 2 characters
             cats_number = 0                     # no cats
+            
     
     for idx in range(cats_number):              # iteration for the number of cats
         if ',' in detected:                     # case there is a comma in detected
@@ -873,13 +1040,17 @@ def analyze_cats_status(cats_status):
                 at_the_door.append(cat_name)    # cat name added to at_the_door
                 lbe_rssi.append(detected[2:])   # lbe_rssi of that tag is assigned
             
+            if verbose:
+                print(txt_1, txt_2)
+            
             # the return break the iteration
             return at_the_door, lbe_rssi, stat_mcu_temp, lora_rssi_sender
-    
+        
     if verbose:
+        print(f"{txt_1}; {txt_2}")
         print("at_the_door, lbe_rssi, stat_mcu_temp, lora_rssi_sender")
         print(at_the_door, lbe_rssi, stat_mcu_temp, lora_rssi_sender )
-        
+    
     # return the empty lists when no cats at the door
     return at_the_door, lbe_rssi, stat_mcu_temp, lora_rssi_sender 
 
@@ -888,25 +1059,28 @@ def analyze_cats_status(cats_status):
 def stop_beep(buzzer_timer=None):
     """Stop buzzer and cleanup timer. Pass timer object as arg to avoid global."""
     
-    BUZZER.duty_u16(65535)  # Transistor OFF
+    BUZZER.duty_u16(65535)  # transistor OFF
     if buzzer_timer:
         buzzer_timer.deinit()
+
 
 
 def start_beep(duration_ms=200, freq=1000, volume=5):
     """Start a beep with auto-stop. Adaptive volume on frequency."""
     
-    stop_beep(buzzer_timer) # Stop any previous beep
+    stop_beep(buzzer_timer) # stop any previous beep
     scaled_volume = max(1, min(100,int(freq * 0.023 + volume * 3.05 + 2 )))  # dynamic volume scaling
     duty = max(250, min(65535, int(65535 - (scaled_volume * 655.35))))       # reversing PWM (transistor), and ceiling it
     freq = max(20, min (4200, freq))                                         # ceiling frequency
-#     print("freq:", freq, "  volume:", scaled_volume, "   duty:", duty)
+#     if verbose:
+#         print("freq:", freq, "  volume:", scaled_volume, "   duty:", duty)
     
-    BUZZER.freq(freq)      # Apply settings
-    BUZZER.duty_u16(duty)  # Apply settings
+    BUZZER.freq(freq)      # apply settings
+    BUZZER.duty_u16(duty)  # apply settings
     buzzer_timer.init(mode=Timer.ONE_SHOT,
-                      period=duration_ms,  # Auto-stop after duration_ms
-                      callback=lambda t: stop_beep(buzzer_timer))
+                      period=duration_ms,  # auto-stop after duration_ms
+                      callback=lambda t: stop_beep(buzzer_timer)
+                      )
 
 
 def activate_buzzer():
@@ -915,77 +1089,25 @@ def activate_buzzer():
         period = 150 + i*10
         start_beep(duration_ms=50+i*10, freq=700, volume=buzzer_volume)
         utime.sleep_ms(period)
- 
+
 
 
 
 def get_display_epd(epd):
-    """Prepares the framebuffer and returns a Display view."""
+    """Function preparing a Display oject based on Framebuffer."""
     
-    h = epd.height
-    w = epd.width
-#     epd.init_Fast()     # wake the epd up from sleep
-    epd.new_buffer(h, w)  # makes a new buffer
-    epd.fb.fill(0xff)     # generates the white background (epd works inverted)
+    epd.init_Fast()     # wake the epd up from sleep
+    epd.new_buffer()    # makes a new HLSB buffer (protrait display orientation ...)
+    epd.fb.fill(0xff)   # generates the white background (epd works inverted)
     
-    # Display framebuffer is needed for the Writer
-    return Display(h, w, epd.buffer)  # note it uses VLSB
+    # display framebuffer is needed for the Writer
+    return Display(epd.height, epd.width, epd.buffer)  # note it uses VLSB
 
 
 
 
-def flush_epd(epd, force_full=False, source=None):
-    """
-    Sends the current framebuffer to the EPD.
-    Uses partial refresh normally, and a full refresh every
-    'epd_full_refresh_every_n' partial updates (or when forced).
-    Returns True if a full refresh was performed.
-    """
-    global partial_refresh_count
-    
-    h = epd.height
-    w = epd.width
-    do_full = force_full or (partial_refresh_count >= epd_full_refresh_every_n)
-
-    if do_full:
-        if verbose:
-            if source is None:
-                print("EPD full refresh")
-            else:
-                print(f"EPD full refresh, source: {source}")
-        clean_mem()
-        
-        # init the EPD, leading to full refresh, and EPD readiness for Partial updates
-        epd.init()
-        epd.Clear()
-        
-        # clean the memory, as the EPD init is quite mem intensive
-        clean_mem()
-        
-        partial_refresh_count = 0
-        
-    else:
-        if verbose:
-            if source is None:
-                print("EPD Partial update")
-            else:
-                print(f"EPD Partial update, source: {source}")
-        
-        partial_refresh_count += 1
-    
-    
-    epd.display_Partial(epd.get_buffer(), x=0, y=0, w=w, h=h)
-    utime.sleep(0.5)
-    epd.sleep()          # force EPD into deepsleep 
-
-    return do_full
-
-
-
-
-
-def header_epd(epd, display_epd, lora_connect_status, wifi_connected, battery_level,
-               date_time, last_stat_mcu_temp, second_row=True):
+def header_epd(epd, display_epd, wri_22, wri_26, lora_connect_status, wifi_connected,
+               battery_level, date_time, last_stat_mcu_temp, second_row=True):
     """
     Plots the one or two headers rows on the EPD display.
     The plotted infor are informative about the system.
@@ -1007,8 +1129,9 @@ def header_epd(epd, display_epd, lora_connect_status, wifi_connected, battery_le
         
         # plot the volume set in the config
         Writer.set_textpos(display_epd, 2, 180)
-        wri = Writer(display_epd, helvetica22bold, verbose=False)
-        wri.printstring(str(buzzer_volume), invert=True)
+        wri_22.printstring(str(buzzer_volume), invert=True)
+        
+        
     
     elif not buzzer_enabled:                          # case the buzzer is disabled
         # plot the crossed bell icon
@@ -1020,9 +1143,8 @@ def header_epd(epd, display_epd, lora_connect_status, wifi_connected, battery_le
     
     
     # plot the time on the first row
-    Writer.set_textpos(display_epd, 2, 206)     # writer coordinates first y then x
-    wri = Writer(display_epd, helvetica22bold, verbose=False)
-    wri.printstring(date_time[10:], invert=True)
+    Writer.set_textpos(display_epd, 2, 206)        # writer coordinates first y then x
+    wri_22.printstring(date_time[10:], invert=True)
     
     
     # plots when the second_row is set True (no radar or cats detections)
@@ -1030,14 +1152,12 @@ def header_epd(epd, display_epd, lora_connect_status, wifi_connected, battery_le
         
         if lora_connect_status:                    # case of LoRa connection success
             Writer.set_textpos(display_epd, 29, 5) # writer coordinates first y then x
-            wri = Writer(display_epd, helvetica22bold, verbose=False)
-            wri.printstring(str(lora_rssi), invert=True)
+            wri_22.printstring(str(lora_rssi), invert=True)
         
         if wifi_connected:                         # case the wifi is connected
             # plot the date on the second row
             Writer.set_textpos(display_epd, 29, 206)  # writer coordinates first y then x
-            wri = Writer(display_epd, helvetica22bold, verbose=False)
-            wri.printstring(date_time[:8], invert=True)
+            wri_22.printstring(date_time[:8], invert=True)
         
         if buzzer_enabled:                         # case the second_row is set True
             # plot the buzzer repeats (R in front) set in the config
@@ -1045,20 +1165,18 @@ def header_epd(epd, display_epd, lora_connect_status, wifi_connected, battery_le
             txt_len = len(txt)
             x = 150 if txt_len>=4 else 158
             Writer.set_textpos(display_epd, 29, x)
-            wri = Writer(display_epd, helvetica22bold, verbose=False)
-            wri.printstring(txt, invert=True)
+            wri_22.printstring(txt, invert=True)
         
         # plot the mcu temperature (alternates Stationary and Portable devices' mcu)
-        if lora_iterations % 2 == 0:               # even LoRa iterations
-            if last_stat_mcu_temp != "":           # case last MCU temp Stationary device is known
+        if lora_iterations % 2 == 0:                   # even LoRa iterations
+            if last_stat_mcu_temp != "":               # case last MCU temp Stationary device is known
                 temp_txt = f"S: {last_stat_mcu_temp}C" # MCU temp of the Stationary device
-            else:                                  # case last MCU temp Stationary device is unknown
+            else:                                      # case last MCU temp Stationary device is unknown
                 temp_txt = f"P: {mcu_temperature()}C"  # MCU temp of the Portable device
-        else:                                      # odd LoRa iterations
-            temp_txt = f"P: {mcu_temperature()}C"  # MCU temp of the Portable device
-        Writer.set_textpos(display_epd, 29, 70)    # writer coordinates first y then x
-        wri = Writer(display_epd, helvetica22bold, verbose=False)
-        wri.printstring(temp_txt, invert=True)     # plot the string
+        else:                                          # odd LoRa iterations
+            temp_txt = f"P: {mcu_temperature()}C"      # MCU temp of the Portable device
+        Writer.set_textpos(display_epd, 29, 70)        # writer coordinates first y then x
+        wri_22.printstring(temp_txt, invert=True)         # plot the string
         
     
     # drawing separation lines after icons and text (prevent lines to be overwritten)
@@ -1081,38 +1199,46 @@ def header_epd(epd, display_epd, lora_connect_status, wifi_connected, battery_le
 
 
     
-def show_info_epd(epd, lora_connect_status, wifi_connected, battery_level, date_time,
-                  last_stat_mcu_temp, radar_detection, cats_at_the_door, cat_at_door_reminder,
-                  cat_at_door_time, cats_lbe_rssi, battery_voltage):
+def show_info_epd(epd, wifi_connected, battery_level, date_time, last_stat_mcu_temp,
+                  radar_detection, cats_at_the_door, cat_at_door_reminder,
+                  cat_at_door_time, cats_lbe_rssi, lora_iterations, battery_voltage):
     
     """
     Recall the one or two headers rows on the EPD display.
     Plots the main info, like the cats names when detected.
     """
     
+    global wri_22, wri_26  # reference to the global Writer font 22 and 26
+    
+    
     # plots the basic info (header), like the connections icons, battery, buzzer, date and time, etc
     display_epd = get_display_epd(epd)
+    
+    wri_22.device = display_epd     # the buffer is assigned to the global Writer device
+    wri_26.device = display_epd     # the buffer is assigned to the global Writer device
+    
+    current_id = id(display_epd)    # Writer id for the current display_epd
+    wri_22.devid = current_id       # Writer id for the current display_epd is assigned to the font 22
+    wri_26.devid = current_id       # Writer id for the current display_epd is assigned to the font 26
     
     # set plt_2nd_row as True on every iteration, and get later set False if other info must be plotted
     plt_2nd_row = True
     
     # number of cats
-    cats_number = len(cats_at_the_door)                  # number of detected cats (via ble tags)
+    cats_number = len(cats_at_the_door)                      # number of detected cats (via ble tags)
     
     # case the the ventual cats presence has not been aknowledged
     if not (cat_at_door_reminder and utime.time() > cat_at_door_time + radar_min_signal_time_s):
         
         # plot a cat icon when the radar detects something and ninfo not yet aknowledged
-        if radar_detection:  # case the radar detects (likely) a cats
+        if radar_detection:                                  # case the radar detects (likely) a cats
             display_epd.blit(Icons.cat_icon_fb, 0, 32)       # plots cat icon to the VLSB frame (it takes ca 60ms)
             plt_2nd_row = False                              # the second header row is not plotted
     
         # updates cats names and BLE signal strenght
         if cats_number > 0:                                  # case there is at least one cat
         
-            plt_2nd_row = False                              # the second header row is not plotted
-            
-            wri = Writer(display_epd, helvetica26bold, verbose=False) # writer coordinates first y then x               
+            plt_2nd_row = False                              # the second header row is not plotted            
             
             # variables to center the cats namea on the display
             font_size = 26                                   # font size
@@ -1132,11 +1258,11 @@ def show_info_epd(epd, lora_connect_status, wifi_connected, battery_level, date_
                 y = max(min_y, min(max_y, y))                # y coordinated is clamped between min and max
                 
                 Writer.set_textpos(display_epd, y, 85)       # defines the text position
-                wri.printstring(cat, invert=True)            # print the cat name
+                wri_26.printstring(cat, invert=True)         # print the cat name
                 
                 if len(cats_lbe_rssi) == cats_number:        # check cats_lbe_rssi coherence with cats_number
                     Writer.set_textpos(display_epd, y, 240)  # defines the text position
-                    wri.printstring(str(cats_lbe_rssi[idx]), invert=True)  # print the cats_lbe_rssi
+                    wri_26.printstring(str(cats_lbe_rssi[idx]), invert=True)  # print the cats_lbe_rssi
                 row += 1                                     # increase the row reference
     
     
@@ -1144,11 +1270,10 @@ def show_info_epd(epd, lora_connect_status, wifi_connected, battery_level, date_
     # reminder remaining on screen after aknowledging the cat presente
     else:
         
-        plt_2nd_row = False                              # the second header row is not plotted
+        plt_2nd_row = False                                  # the second header row is not plotted
         
-        Writer.set_textpos(display_epd, 70, 10) 
-        wri = Writer(display_epd, helvetica22bold, verbose=False)
-        wri.printstring("REMEMBER THE CAT(S) ?", invert=True)
+        Writer.set_textpos(display_epd, 70, 10)
+        wri_22.printstring("REMEMBER THE CAT(S) ?", invert=True)
     
     
     if plt_2nd_row:
@@ -1156,34 +1281,36 @@ def show_info_epd(epd, lora_connect_status, wifi_connected, battery_level, date_
 #         ##############################################################################
 #         ##############################################################################
 #         Writer.set_textpos(display_epd, 80, 0)    # writer coordinates first y then x
-#         wri = Writer(display_epd, helvetica22bold, verbose=False)
-#         wri.printstring(str(battery_voltage), invert=True)
+#         wri_22.printstring(str(battery_voltage), invert=True)
 #         ##############################################################################
 #         ##############################################################################
         
         
         # plot the LoRa connections counter
-        connections_txt = f"SCAN {lora_iterations}"  # string with the lora_iterations
-        if not lora_connect_status:                # case the (last) LoRa connection fails
-            connections_txt += "(NO LoRa)"         # a note is added to the text message
+        connections_txt = f"SCAN {lora_iterations}" # string with the lora_iterations
+        if not lora_connect_status:                 # case the (last) LoRa connection fails
+            connections_txt += "(NO LoRa)"          # a note is added to the text message
         
         # plot the LoRa tx_power level used
         if lora_tx_power is not None:
             connections_txt += "  dB " + str(lora_tx_power)
         
-        Writer.set_textpos(display_epd, 105, 0)    # writer coordinates first y then x
-        wri = Writer(display_epd, helvetica22bold, verbose=False)
-        wri.printstring(connections_txt, invert=True)
-    
+        Writer.set_textpos(display_epd, 105, 0)     # writer coordinates first y then x
+        wri_22.printstring(connections_txt, invert=True)
+
     
     # plot the first header row, eventually also the second one, with various info
-    header_epd(epd, display_epd, lora_connect_status, wifi_connected, battery_level,
+    header_epd(epd, display_epd, wri_22, wri_26, lora_connect_status, wifi_connected, battery_level,
                date_time, last_stat_mcu_temp, second_row = plt_2nd_row)
     
-    # call the EPD flushing function
-    flush_epd(epd, source='show_info_epd')
-
-
+    epd.get_buffer()    # rotates the buffer to send it to the display (portrait wrinting, resulting (takes ca 60ms)
+    epd.display()       # plots the buffer to the display (takes ca 1.8 secs)
+    epd.sleep()         # prevents display damages on the long run (command takes ca 100ms)
+    
+    Writer.state = {current_id: Writer.state.get(current_id, None)}
+    Writer.state.clear()
+    clean_mem()
+    
 
 
 
@@ -1192,34 +1319,33 @@ def show_ack_epd(epd, lora_connect_status, wifi_connected, battery_level,
     """
     Plots an AKNOWLEDGEMENT feedback on the EPD display.
     """
+    global wri_26  # reference the global Writer font 26
     
-    # discharge display_epd object for memory managment
-    display_epd = None
-    
+    # generate the new epd buffer
     display_epd = get_display_epd(epd)
 
-    wri = Writer(display_epd, helvetica26bold, verbose=False) # writer coordinates first y then x
-    Writer.set_textpos(display_epd, 60, 40)        # 68, 40    # defines the text position
-    wri.printstring("AKNOWLEDGED", invert=True)               # print the ack
     
-    # call the EPD flushing function
-    flush_epd(epd, source='show_ack_epd')
+    wri_26.device = display_epd                     # new buffer assigned to global Writer device
+    current_id = id(display_epd)                    # Writer id for the current display_epd
+    wri_26.devid = current_id                       # Writer id for the current display_epd is assigned to the font 26
     
-    # discharge display_epd object for memory managment
-    display_epd = None
+
+    # apply the text to position
+    Writer.set_textpos(display_epd, 60, 40)         # defines the text position
+    wri_26.printstring("AKNOWLEDGED", invert=True)  # print the ack usando il modulo globale
     
-    # force a memory cleaning cycle
+    epd.get_buffer()    # rotates the buffer to send it to the display (portrait wrinting, resulting (takes ca 60ms)
+    epd.display()       # plots the buffer to the display (takes ca 1.8 secs)
+    epd.sleep()         # prevents display damages on the long run (command takes ca 100ms)
+    
+    Writer.state = {current_id: Writer.state.get(current_id, None)}
+    Writer.state.clear()
     clean_mem()
-        
+    
     if show_time > 0:
         t_ref = utime.time()
         while utime.time() - t_ref < show_time:
             utime.sleep(0.1)
-        
-#         utime.sleep(show_time)    # sleep time to let the message visible
-
-
-
 
 
 
@@ -1227,22 +1353,41 @@ def show_deepsleep_epd():
     """
     Plots a sleeping icon on the EPD display.
     """
-
-    clean_mem()
-
+#     clean_mem()
+    if verbose:
+        check_mem("Memory before displaying show_deepsleep_epd logo:")
+    
     # plots deepsleep image to the EPD before before entering in deepsleep
     with open("lib/deepsleep_icon.bin", "rb") as f:       # opens the binary file with welcome bmp image
         deepsleep_icon = bytearray(f.read())              # makes a bytearray from the image
-    
-    epd = EPD(width=128, height=296, orientation=0)       # valid orientation is 0 for this image
-    epd.init_Fast()             # wake the epd up from sleep
+
+    epd = EPD(width=128, height=296, orientation=0)       # valid is 0 for this image
+    epd.init()                  # wake the epd up from sleep
     epd.buffer = deepsleep_icon # fills the framebuffer with the welcome_icon
-    clean_mem()
-    epd.display(epd.get_buffer()) # plots the deepsleep_icon framebuffer to the display (takes ca 1.8 secs)
+    epd.display()               # plots the buffer to the display (takes ca 1.8 secs)
     utime.sleep(1)
     epd.sleep()                 # prevents display damages on the long run (command takes ca 100ms)
-    clean_mem()
+#     clean_mem()
+    if verbose:
+        check_mem("Memory after displaying show_deepsleep_epd logo:")
     utime.sleep(5)              # sleep time ensuring the display gets updated
+ 
+
+
+def maintenance_writer_clear():
+    """
+    Periodical maintenance routine to prevent memory leaks.
+    Completely flushes the global Writer.state dictionary and 
+    forces an immediate garbage collection to reclaim memory.
+    """
+    
+    try:
+        Writer.state.clear()
+        clean_mem()
+        if verbose:
+            print("[MAINTENANCE] global Writer state cleared and heap optimized successfully.")
+    except Exception as e:
+        print(f"[MAINTENANCE ERROR] failed to clear Writer state: {e}")
 
 
 
@@ -1258,53 +1403,69 @@ def oled_display_text(oled_display, oled_backlight_pin, text_lines, keep_active=
     :param disp_time_ms:       Time in milliseconds to display the text (only used if keep_active is False).
     """
 
-#     oled_display_clean(oled_display)             # Clear the oled_display
+#     oled_display_clean(oled_display)             # clear the oled_display
     oled_display.fill(0)                      # clear the screen (all pixels to black)
     for text, x, y, color in text_lines:
         oled_display.text(text, x, y, color)
     oled_display.show()
-    oled_backlight_pin.value(0)               # Drive low to enable backlight
+    oled_backlight_pin.value(0)               # drive low to enable backlight
     
-    if not keep_active:                       # Only sleep if keep_active is False
+    if not keep_active:                       # only sleep if keep_active is False
         utime.sleep_ms(disp_time_ms)
         oled_display.fill(0)                  # clear the screen (all pixels to black)
         oled_display.show()
-        oled_backlight_pin.value(1)           # Drive high to disable backlight
+        oled_backlight_pin.value(1)           # drive high to disable backlight
+
+
+
+def log_heartbeat(fname, line, max_bytes=4000):
+    """
+    Append a line to a small log file on flash.
+    If the file exceeds max_bytes, delete it and start fresh.
+    Silently swallows errors so a full flash or bad FS doesn't break the main loop.
+    """
+    try:
+        import os
+        try:
+            if os.stat(fname)[6] > max_bytes:
+                os.remove(fname)
+        except OSError:
+            pass
+        with open(fname, "a") as f:
+            f.write(line + "\n")
+    except Exception as e:
+        print(f"log_heartbeat failed: {e}")
 
 
 
 def goto_deepsleep():
     """Stops the periferies, calls the sleep icon for the EPD dispaly and call the MCU deepsleep."""
     
-    print("\nPreparing for MCU deepsleep")
+    if verbose:
+        print("\nPreparing for MCU deepsleep")
     
     if wifi_enabled:
         try:
             wlan.active(False)
-            print("Turned the wifi off")
+            if verbose:
+                print("Turned the wifi off")
         except:
             pass
     
-    try:
-        lora_sx.sleep(retainConfig=False)
-        print("Set the LoRa chip in sleep mode")
-    except:
-        pass
+    lora_sleep()
     
     try:
         lora_sx.spi.deinit()
-        print("Set the SPI bus off")
+        if verbose:
+            print("Set the SPI bus off")
     except:
         pass
     
-    print("\nPrepapring for MCU deepsleep ...\n\n")
+    if verbose:
+        print("\nMCU deepsleep ...\n\n")
     utime.sleep(0.5)         # short delay
     
     show_deepsleep_epd()     # epd display plots a sleeping feedback
-    
-    print("\nMCU deepsleep ...\n\n")
-    utime.sleep(1)           # short delay
-    
     deepsleep()              # device goes into deepsleep
 
 
@@ -1314,7 +1475,7 @@ def goto_deepsleep():
 ################################################################################################
 ################################################################################################
 #                                                                                              #
-#                                       main program                                           #
+#                                       Main program                                           #
 #                                                                                              #
 ################################################################################################
 ################################################################################################
@@ -1324,24 +1485,48 @@ def goto_deepsleep():
 
 # prints the last reset reason
 reset_reason, reset_msg = get_reset_reason()
-print(f"\nLast reset reason: {reset_msg}\n")
+if verbose:
+    print(f"\nLast reset reason: {reset_msg}\n")
 
 
 # preserving memory when power OFF
 # this is used for timeout monitoring (ignores evental WDT reboots if code freezes)
-rtc = RTC()                              # instantiation of RTC
+rtc = RTC()                      # instantiation of RTC
 
 
-# load the lora_iterations counter from the RTC memory
-lora_iterations = load_counter() # counter holding the total number of lora connections (also unsuccessful)              
+# load the RTC-resident state (iterations, previous reset reason, reboot count)
+lora_iterations, prev_reset_reason, reboot_count = load_rtc_state()             
 
 
-# Reset lora_iterations counter if power-on reset or if RTC memory is invalid
-if reset_reason == PWRON_RESET or lora_iterations is None:
+if lora_iterations is None:
+    # RTC memory invalid (first boot after firmware update, or corruption)
     lora_iterations = 0
-    print("Starting new lora_iterations counter from 0")
+    prev_reset_reason = None
+    reboot_count = 0
+    if verbose:
+        print("RTC memory invalid: starting fresh")
+        print("Starting new lora_iterations counter from 0")
+
+elif reset_reason == PWRON_RESET:
+    # clean power-on: reset everything
+    lora_iterations = 0
+    reboot_count = 0
+    if verbose:
+        print(f"Previous reset reason: {prev_reset_reason}")
+        print("POWER-ON RESET: starting new session")
+        print("Starting new lora_iterations counter from 0")
+
 else:
-    print(f"Proceeding lora_iterations counter from {lora_iterations}")
+    # this is a reboot (WDT, soft reset, deepsleep wake, etc.)
+    reboot_count += 1
+    if verbose:
+        print(f"Previous reset reason: {prev_reset_reason}")
+        print(f"REBOOT DETECTED (#{reboot_count}) - reset_reason={reset_reason}")
+        print(f"Proceeding lora_iterations counter from {lora_iterations}")
+
+# persist the updated state immediately
+save_rtc_state(lora_iterations, reset_reason, reboot_count)
+
 
 # set WDT related variables
 if WDT_ENABLED:                          # case the WDT_ENABLED is set True
@@ -1349,56 +1534,84 @@ if WDT_ENABLED:                          # case the WDT_ENABLED is set True
     wdt = WDT(timeout = wdt_time_ms)     # watchdog to wake the ESP32 if got freezing
 
 
-# Load configuration
+# push button interrupt
+PUSH_BUTTON.irq(trigger=Pin.IRQ_FALLING, handler=btn_pressed)
+
+# rotary encoder initial variabile
+rotary = RotaryIRQ(pin_num_clk=2, pin_num_dt=3, min_val=0, max_val=10, reverse=True, range_mode=RotaryIRQ.RANGE_WRAP)
+last_encoder_value = rotary.value() # read and print rotary value
+
+# datetime conversion from EPOCH to date time
+converter = DateTimeConverter()
+
+# load configuration
 config = load_config(FILE_NAME_CONFIG)
 
-
-
 # retrive settings from the config dictionaty
-
-wifi_enabled =      bool(config["wifi"]["enable"])       # wifi gets eventually enabled
-oled_disp_enabled = bool(config["oled_display"]["oled_enabled"]) # oled display gets eventually enabled
-sytem_timeout_m =        config["system"]["timeout_m"]   # timeout, in minutes, for the portable device deepsleep
-lora_interval_s =        config["system"]["lora_interval_s"] # cadence, in secs, to connect with the stationary device
-utc_shift =              config["time"]["timezone"]      # Adjust UTC time by timezone and DST (Day Saving Time: 1=yes, 0=no)
-dst_shift =              config["time"]["dst"]           # dst_shift = utc_shift + 1 if config["time"]["dst"] else utc_shift
-
-duty_cycle_percent =     config["lora"]["duty_cycle_percent"]  # allowed duty-cycle in percentage (1 for 1% ; 0.1 for 0.1%)
-
+wifi_enabled =           bool(config["wifi"]["enable"])               # wifi gets eventually enabled
+oled_disp_enabled =      bool(config["oled_display"]["oled_enabled"]) # oled display gets eventually enabled
+sytem_timeout_m =         int(config["system"]["timeout_m"])          # timeout, in minutes, for the portable device deepsleep
+lora_interval_s =         int(config["system"]["lora_interval_s"])    # cadence, in secs, to connect with the stationary device
+utc_shift =               int(config["time"]["timezone"])             # adjust UTC time by timezone and DST (Day Saving Time: 1=yes, 0=no)
+dst_shift =               int(config["time"]["dst"])                  # dst_shift = utc_shift + 1 if config["time"]["dst"] else utc_shift
+duty_cycle_percent =    float(config["lora"]["duty_cycle_percent"])   # allowed duty-cycle in percentage (1 for 1% ; 0.1 for 0.1%)
 radar_min_signal_time_s = int(config["scanners"]["radar_keep_signal_period_s"])  # period (s) idling after acknowledge 'cats at the door'
+buzzer_enabled =         bool(config["buzzer"]["enable"])             # enable/disable the buzzer function
+buzzer_repeats =          int(config["buzzer"]["repeats"])            # max number of times the buzzer should be activated
+buzzer_volume =           int(config["buzzer"]["volume"])             # buzzer volume
 
-# cadence for EPD full refresh after n partial updates
-epd_full_refresh_every_n = int(config["system"]["epd_full_refresh_every_n"])
-
-buzzer_enabled = bool(config["buzzer"]["enable"])  # enable/disable the buzzer function
-buzzer_volume =  int(config["buzzer"]["volume"])   # buzzer volume
-if buzzer_volume > 9:                              # case buzzer_volume is > than 9 (likely entered as range 0~100)
-    buzzer_volume = buzzer_volume * 9 // 100       # buzzer volume is scaled down to range 0~9
-buzzer_repeats = int(config["buzzer"]["repeats"])  # max number of times the buzzer should be activated
+if buzzer_volume > 9:                                                 # case buzzer_volume is > than 9 (likely entered as range 0~100)
+    buzzer_volume = buzzer_volume * 9 // 100                          # buzzer volume is scaled down to range 0~9
 
 
 # cadence for LoRa connection to the stationary device is calculated in milliseconds
-lora_conn_interval_ms = int(1000 * lora_interval_s)   # period (in ms) in between devices LoRa communication
+lora_conn_interval_ms = int(1000 * lora_interval_s)                   # period (in ms) in between devices LoRa communication
 
 # the max number of LoRa iterations is calculated 
-max_lora_iterations = int(sytem_timeout_m * 60 / lora_interval_s) # max number of iterations (lora connections to stationary dev)
+max_lora_iterations = int(sytem_timeout_m * 60 / lora_interval_s)     # max number of iterations (lora connections to stationary dev)
 
 # after the initial settings the wdt is linked to the lora_conn_interval_ms
-if WDT_ENABLED:                     # case the WDT_ENABLED is set True
+if WDT_ENABLED:                                     # case the WDT_ENABLED is set True
     wdt_time_ms = int(2.5 * lora_conn_interval_ms)  # watchdog time (in ms) 
-    wdt = WDT(timeout = wdt_time_ms)    # watchdog to wake the ESP32 if got freezing
+    wdt = WDT(timeout = wdt_time_ms)                # watchdog to wake the ESP32 if got freezing
 
 
 # Load ble_tags data
 my_ble_tags = load_tag_ids(FILE_NAME_TAGS)
 cats_number, cats_idx, cats_names, cats_macs, no_cats_text = decode_my_ble_tags(my_ble_tags)
 cats_status = no_cats_text
-# print("my_ble_tags:", my_ble_tags)
-# print(f"\nText for no-cats detection: {no_cats_text}")
-# print(f"(info: first digit is cat_idx, second digit means absence), r means radar detected something\n")
+# if verbose:
+#     print("my_ble_tags:", my_ble_tags)
+#     print(f"\nText for no-cats detection: {no_cats_text}")
+#     print(f"(info: first digit is cat_idx, second digit means absence), r means radar detected something\n")
 
 
-# Initialize the SX1262 LoRa module
+if not wifi_enabled:                              # case the wifi is disabled
+    if verbose:
+        print("\nWi-Fi is disabled")
+    
+elif wifi_enabled:                                # case the wifi is enabled
+    if verbose:
+        print("\nWi-Fi is enabled")
+    try:
+        wlan, wifi_connected = get_wlan(config)   # activate the WiFi
+    except Exception as e:
+        print(f"Error while setting the WLAN : {e}")
+        wifi_connected = False
+    
+    if wifi_connected:
+        try:
+              # update the system date and time from the NTP
+              date_time = update_time(ntp_sync=True)
+        except Exception as e:
+            print(f"Error while updating the time: {e}")
+            
+        disconnect_wifi()                         # disconnect the WiFi
+        # note: wifi_connected is kept True, to display the WiFi symbol indicating WiFi was ok
+        
+
+
+# initialize the SX1262 LoRa module
 lora_sx, lora_tx_power, initial_lora_tx_power = init_lora(config)
 
 
@@ -1406,74 +1619,51 @@ lora_sx, lora_tx_power, initial_lora_tx_power = init_lora(config)
 lora_interval_s = validate_lora_interval_s(duty_cycle_percent, lora_interval_s, cats_number)
 
 
-# datetime conversion from EPOCH to date time
-converter = DateTimeConverter()
-
-
-# push button interrupt
-PUSH_BUTTON.irq(trigger=Pin.IRQ_FALLING, handler=btn_pressed)
-
-
-# rotary encoder initial variabile
-rotary = RotaryIRQ(pin_num_clk=2, pin_num_dt=3, min_val=0, max_val=10, reverse=True, range_mode=RotaryIRQ.RANGE_WRAP)
-last_encoder_value = rotary.value() # read and print rotary value
-
-
-# Setting up the oled display, if enabled
+# setting up the oled display, if enabled
 if not oled_disp_enabled:
-    print("\nOled display is disabled")
+    if verbose:
+        print("\nOled display is disabled")
 
 elif oled_disp_enabled:
-    print("\nOled display is enabled")
-    i2c = get_i2c(config)                             # Initialize I2C
-    oled_display = ssd1306.SSD1306_I2C(128, 64, i2c)  # Initialize the OLED display
-    oled_backlight_pin = init_oled_backlight(config)  # Initialize backlight
+    if verbose:
+        print("\nOled display is enabled")
+    i2c = get_i2c(config)                             # initialize I2C
+    oled_display = ssd1306.SSD1306_I2C(128, 64, i2c)  # initialize the OLED display
+    oled_backlight_pin = init_oled_backlight(config)  # initialize backlight
 
 
-# Setting up the Wi-Fi, if enabled
-if not wifi_enabled:
-    print("\nWi-Fi is disabled")
+# initializing the Writes modules in global scope
+display_init = get_display_epd(epd)
+wri_22 = Writer(display_init, helvetica22bold, verbose=False)
+wri_26 = Writer(display_init, helvetica26bold, verbose=False)
 
-elif wifi_enabled:
-    print("\nWi-Fi is enabled")
-    try:
-        wlan, wifi_connected = get_wlan(config) # Connect to WiFi
-    except Exception as e:
-        print(f"Error while setting the WLAN : {e}")
-        print("\nWi-Fi gets disabled")
-        wifi_enabled = False
-        
 
-# force a memory cleaning cycle, after the function loading
-clean_mem()
-
-# force the PD init for partial updates
-epd.init()
-epd.Clear()
-
-# force a memory cleaning cycle, after the EPD init
+# force a memory cleaning cycle
 clean_mem()
 
 # update the date and time (when WiFi connection it uses NTP server)
 now = utime.time()
-last_ntp_time_update = 0
-last_ntp_time_update, date_time = update_time(now, last_ntp_time_update, NTP_UPDATE_INTERVAL_S, first_time=True)
 
 
 # first check of the battery voltage and related level
-batt_ret = check_battery(now,
-                         battery_voltage,
-                         battery_voltage_list,
-                         battery_level,
-                         last_battery_check_time,
-                         BATTERY_CHECK_INTERVAL_S,
-                         force_battery_check = True)
-battery_voltage, battery_voltage_list, battery_level, last_battery_check_time = batt_ret
+if now > last_battery_check_time + BATTERY_CHECK_INTERVAL_S:
+    battery_voltage, battery_voltage_list, battery_level = check_battery(battery_voltage_list)
+    
+    # update the time reference of latest battery check
+    last_battery_check_time = now
 
 
-print(f"\n\n{'#' * 60}")
-print(f"{'#' * 11}    Portable device is active ...    {'#' * 12}")
-print(f"{'#' * 60}\n")
+
+# assign the correct 'now' (after NTP sync) to the variables linked to periodical actions
+last_battery_check_time = now
+last_ntp_time_update = now
+last_writer_cleaning = now
+
+
+if verbose:
+    print(f"\n\n{'#' * 60}")
+    print(f"{'#' * 11}    Portable device is active ...    {'#' * 12}")
+    print(f"{'#' * 60}\n")
 
 
 
@@ -1481,15 +1671,13 @@ print(f"{'#' * 60}\n")
 ################################################################################################
 ################################################################################################
 #                                                                                              #
-#                              repeating part of the main program                              #
+#                              Repeating part of the main program                              #
 #                                                                                              #
 ################################################################################################
 ################################################################################################
 ################################################################################################
 
-
-
-while True:    
+while True:
     
     # feed the wdt in case it is enabled
     if WDT_ENABLED:              # case the WDT_ENABLED is set True
@@ -1500,36 +1688,72 @@ while True:
     now = utime.time()           # current epoch time in seconds
     now_ms = utime.ticks_ms()    # current time in milliseconds (not referenced to the real word time)
     
-    
+    # check if the push button got pressed, since last cycle
     if button_edge_ms:
         if utime.ticks_diff(now_ms, button_edge_ms) >= BUTTON_DEBOUNCE_MS:
-            edge_ms = button_edge_ms
-            button_edge_ms = 0                       # consume the edge
-            if PUSH_BUTTON.value() == 0:             # still low after debounce → real press
+            button_edge_ms = 0                     # reset the debounce counter
+            if PUSH_BUTTON.value() == 0:           # check if the button is still pressed
+                
+                # case the butto remain pressed for at least BUTTON_BLOCK_MS
                 if utime.ticks_diff(now_ms, button_last_ms) >= BUTTON_BLOCK_MS:
-                    button_last_ms = now_ms
-                    button_pressed = True
-                    print("Button Pressed!")         # feedback is printed to the shell
+                    button_last_ms = now_ms        # assign the latest button pressing
+                    button_pressed = True          #
+                    if verbose:
+                        print("Button Pressed!")
     
     
     if button_pressed and cat_at_door_flag:
         Writer.state.clear()
-        clean_mem()
+        check_mem("Memory at button pressing with cat at the door flag:")
     
     
-    # check the battery voltage and level (no action when BATTERY_CHECK_INTERVAL_S is not elapsed)
-    force_battery_check = True if battery_level <= 20 else False 
-    batt_ret = check_battery(now,
-                             battery_voltage,
-                             battery_voltage_list,
-                             battery_level,
-                             last_battery_check_time,
-                             BATTERY_CHECK_INTERVAL_S,
-                             force_battery_check)
-    battery_voltage, battery_voltage_list, battery_level, last_battery_check_time = batt_ret
+    # case it is time to check the battery
+    if now > last_battery_check_time + BATTERY_CHECK_INTERVAL_S:
+        # check the battery voltage and level
+        battery_voltage, battery_voltage_list, battery_level = check_battery(battery_voltage_list)
+        # update the time reference of latest battery check
+        last_battery_check_time = now
 
-    # check the current time and synchronize with npt (no action when NTP_UPDATE_INTERVAL_S is not elapsed)
-    last_ntp_time_update, date_time = update_time(now, last_ntp_time_update, NTP_UPDATE_INTERVAL_S)
+    
+    # case the wifi is enabled, and it is time to refresh date and time from NTP server
+    if wifi_enabled and now > last_ntp_time_update + NTP_UPDATE_INTERVAL_S:
+        
+        # force the LoRa to sleep
+        lora_sleep()
+        
+        # activate the WiFi
+        try:
+            wlan, wifi_connected = get_wlan(config)   # activate the WiFi
+        except Exception as e:
+            print(f"Error while setting the WLAN : {e}")
+            wifi_connected = False
+        
+        # check the current time and synchronize with NTP
+        if wifi_connected:
+            try:
+                # update the system date and time from the NTP, and save a hartbeat
+                date_time = update_time(ntp_sync=True)  
+            except Exception as e:
+                print(f"Error while updating the time: {e}")
+        
+            # update the time reference of latest NTP sync
+            last_ntp_time_update = now
+        
+            # disconnect the WiFi
+            disconnect_wifi()
+            # note: wifi_connected is kept True, to display the WiFi symbol indicating WiFi was ok
+        
+        # wake up the lora to standby
+        lora_standby()
+    
+    else:
+        date_time = update_time(ntp_sync=False)  # update the date based on local tick
+        
+    
+    # half-hour cleaning of the Writer glyphs
+    if now > last_writer_cleaning + 1800:
+        maintenance_writer_clear()
+        last_writer_cleaning = now
     
     
     # button status check
@@ -1544,16 +1768,18 @@ while True:
             cats_at_the_door = []              # reset tle list of the cats names
             cats_status = no_cats_text         # reset the cats_status
             buzzer_done = buzzer_repeats       # prevents further buzzing
-            print("Aknowledged the cat_at_door presence")  # feedback is printed to the terminal
+            if verbose:
+                print("Aknowledged the cat_at_door presence")  # feedback is printed to the terminal
             show_ack_epd(epd, lora_connect_status, wifi_connected, battery_level,
                          date_time, last_stat_mcu_temp, show_time=5) # plot info to the epd display
-            
         
-        # if cat_at_door_reminder and appearing on screen with some delay, then it acts as reminder aknowledgement
+        
+        # if cat_at_door_reminder, then it acts as reminder aknowledgement
         if cat_at_door_reminder and utime.time() > cat_at_door_time + radar_min_signal_time_s:
             cat_at_door_reminder = False       # reset the cat_at_door_reminder 
             buzzer_done = 0                    # reset the buzzer counter
-            print("Aknowledged the cat_at_door reminder")  # feedback is printed to the terminal
+            if verbose:
+                print("Aknowledged the cat_at_door reminder")  # feedback is printed to the terminal
 
     
     # checking if it is time connect with the stationary device
@@ -1562,8 +1788,8 @@ while True:
         # counter tracking the device ON time, based on the lora connections
         lora_iterations += 1
         
-        # saves the lora_iterations counter in the RTC memory (
-        save_rtc_counter(lora_iterations)
+        # save the updated iteration counter in RTC memory
+        save_rtc_state(lora_iterations, reset_reason, reboot_count)
         
         # lora_connect_status is set False at every run.
         lora_connect_status = False 
@@ -1575,7 +1801,6 @@ while True:
         toa_us = lora_sx.getTimeOnAir(len(query))
 
         # looping while waiting to the LoRa response (max 3 secs)
-        # lora_callback updates the cats_status Global variable 
         t_ref = utime.ticks_ms()
         while utime.ticks_ms() - t_ref < 3000:
             if lora_connect_counter > prev_lora_connect_counter:
@@ -1593,7 +1818,8 @@ while True:
         if not lora_connect_status: # case no connections with the stationary device
             # lora_last_connect_time_ms is a global variable updated by the LoRa function 'cb' or forced right here
             lora_last_connect_time_ms = now_ms
-            print("LoRa connection failure: Check if the stationary device is powered on")
+            if verbose:
+                print("LoRa connection failure: Check if the stationary device is powered on")
         
         # debug purpose: force radar and cat detection for debug purpose:
 #         cats_status = "r01-90"
@@ -1603,7 +1829,6 @@ while True:
         
         # reset cat_at_door_flag (i.e. when the stationary dev is booted)
         if cats_status[0] == 'd':                   # 'd' means disabled
-            print("cats_status set to False on request of the Portable device (i.e. due to booting")
             cat_at_door_flag = False                # flag to track the presence of cats at the door is set False
             cats_status = cats_status[1:]           # initial 'd' is removed from the cats_status string
         
@@ -1613,9 +1838,9 @@ while True:
         # case no mcu_temp update from the stationary device
         if stat_mcu_temp != "":
             last_stat_mcu_temp = stat_mcu_temp
-        
-        # reset variable right after cat presence aknowledgement
-        if button_pressed and utime.time() - cat_at_door_time <  radar_min_signal_time_s:  # case the cats detection has been aknowledged
+
+        # reset variable right after cat presence aknoledgement
+        if utime.time() - cat_at_door_time <  radar_min_signal_time_s:  # case the cats detection has been aknowledged
             cat_at_door_flag = False                       # reset the cat_at_door_flag status
             cats_at_the_door = []                          # reset tle list of the cats names
             cats_status = no_cats_text                     # reset the cats_status
@@ -1641,12 +1866,13 @@ while True:
         if buzzer_enabled and cat_at_door_flag and buzzer_done < buzzer_repeats:
             activate_buzzer()
             buzzer_done += 1
-            print("buzzer_done:", buzzer_done, "   buzzer_repeats:", buzzer_repeats)
+            if verbose:
+                print("buzzer_done:", buzzer_done, "   buzzer_repeats:", buzzer_repeats)
         
         # update the epd display
-        show_info_epd(epd, lora_connect_status, wifi_connected, battery_level, date_time,
-                      last_stat_mcu_temp, radar_detection, cats_at_the_door, cat_at_door_reminder,
-                      cat_at_door_time, cats_lbe_rssi, battery_voltage)
+        show_info_epd(epd, wifi_connected, battery_level, date_time, last_stat_mcu_temp,
+                      radar_detection, cats_at_the_door, cat_at_door_reminder,
+                      cat_at_door_time, cats_lbe_rssi, lora_iterations, battery_voltage)
         
         # check and eventually adjust the loRa trasnmission power
         lora_tx_power, missed_lora_packets, lora_sender_pwr_action = adjust_lora_tx_power(lora_rssi_sender,
@@ -1656,48 +1882,34 @@ while True:
         # preventing LoRa power adjustments based on old lora_rssi values
         lora_rssi = None    # set lora_rssi to None
         
-        # measure the cycle time (in ms)
-        cycle_time = utime.ticks_ms() - now_ms
-        
-        # calculate the sleeping time, to maintain the lora_conn_interval_ms cadence
-        sleep_ms = lora_conn_interval_ms - cycle_time
-        
-        # clean the Writer state
-        Writer.state.clear()
-        
-        # force a memory cleaning cycle
-        clean_mem()
-        
-        # clamp the sleeping time
-        if sleep_ms < 200:
-            sleep_ms = 200
-        elif sleep_ms > lora_conn_interval_ms:
-            sleep_ms = lora_conn_interval_ms
-        
-        
-        # MCU lightsleep while waiting for the next loRa connections (reduce battery consumption)
-        if not cat_at_door_flag:
-            if WDT_ENABLED:
-                wdt.feed()
+        # case the cat_at_door_flag is False, or the cat_at_door_reminder is displayed
+        if not cat_at_door_flag or (cat_at_door_reminder and utime.time() > cat_at_door_time + radar_min_signal_time_s):
             
-            for p in (epd.cs_pin, epd.dc_pin, epd.reset_pin):
-                p.init(Pin.OUT, hold=True)
+            # measure the cycle time (in ms)
+            cycle_time = utime.ticks_ms() - now_ms
+            
+            # calculate the sleeping time, to maintain the lora_conn_interval_ms cadence
+            sleep_ms = lora_conn_interval_ms - cycle_time
+            
+            # clamp the sleeping time
+            if sleep_ms < 200:
+                sleep_ms = 200
+            elif sleep_ms > lora_conn_interval_ms:
+                sleep_ms = lora_conn_interval_ms
             
             if verbose:
                 print(f"Going to lightspeep for {sleep_ms} ms")
-                print()
-            
+
+            # MCU lightsleep while waiting for the next loRa connections (reduce battery consumption)
             lightsleep(sleep_ms)
-            
-            for p in (epd.cs_pin, epd.dc_pin, epd.reset_pin):
-                p.init(Pin.OUT, hold=False)
+
         
         # checks if devise is active longer than timeout; If so go to deepsleep
         if lora_iterations >= max_lora_iterations:   # case the lora iterations equals/exceed the max
             goto_deepsleep()                         # calls the goto_deepsleep function
         
+        
     else:                 # case it is not time to communicate with the stationary device
         utime.sleep(0.05) # sleep for some little time
         
 # end of code
-
